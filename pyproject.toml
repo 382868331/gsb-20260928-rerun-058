@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taintl"
+version = "0.1.0"
+description = "Text-only taint analyzer for a small teaching language"
+requires-python = ">=3.10"
+
+[project.scripts]
+taintl = "taintl.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

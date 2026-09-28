@@ -1,0 +1,5 @@
+fn main() {
+  let input = read_input();
+  let checked = sanitize(input);
+  danger(checked);
+}

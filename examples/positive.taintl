@@ -1,0 +1,9 @@
+fn wrap(value) {
+  return value;
+}
+
+fn main() {
+  let input = read_input();
+  let passed = wrap(input);
+  danger(passed);
+}
