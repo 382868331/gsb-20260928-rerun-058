@@ -1,0 +1,8 @@
+[project]
+name = "taintlab"
+version = "0.1.0"
+requires-python = ">=3.10"
+description = "小型教学语言的静态污点分析基础库：追踪不可信输入到危险操作的传播路径"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
