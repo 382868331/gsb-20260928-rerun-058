@@ -2,6 +2,7 @@ import unittest
 
 from taintlab import (
     AnalysisConfig,
+    ExternalSpec,
     LexerError,
     ParseError,
     Severity,
@@ -172,6 +173,110 @@ class TaintAnalysisTests(unittest.TestCase):
         source = "def main(){ exec(mystery(read_input())); }"
         result = analyze_source(source)
         self.assertIs(result.verdict, Verdict.UNSAFE)
+        self.assertTrue(any(d.rule == "TAINT-FLOW" for d in result.diagnostics))
+
+    def test_unknown_zero_arg_return_to_sink_is_not_safe(self):
+        # 回归：无参数的未知函数返回值曾被当成干净数据，导致漏报。
+        source = "def main(){ token = get_token(); exec(token); }"
+        result = analyze_source(source)
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+        self.assertEqual(
+            [d.rule for d in result.diagnostics], ["TAINT-UNCERTAIN"]
+        )
+        self.assertTrue(
+            any("缺少行为说明" in n for n in result.notes)
+        )
+        kinds = [h.kind for h in result.diagnostics[0].paths[0].hops]
+        self.assertIn("unknown", kinds)
+        self.assertEqual(kinds[-1], "sink")
+
+    def test_unknown_zero_arg_return_unused_is_still_incomplete(self):
+        # 仅出现未知调用（未流入 sink）也不能输出无依据的 SAFE。
+        result = analyze_source("def main(){ x = get_token(); } def f(){ helper(); }")
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+
+    def test_external_spec_clean_makes_verdict_safe_and_records_dependency(self):
+        source = "def main(){ token = get_token(); exec(token); }"
+        cfg = AnalysisConfig(
+            external_specs={
+                "get_token": ExternalSpec(
+                    "get_token", "框架保证返回已编码的常量令牌", returns="clean"
+                )
+            }
+        )
+        result = analyze_source(source, cfg)
+        self.assertIs(result.verdict, Verdict.SAFE)
+        self.assertEqual(result.diagnostics, [])
+        self.assertTrue(
+            any("依赖以下外部调用行为说明" in n and "get_token" in n for n in result.notes)
+        )
+
+    def test_external_spec_tainted_reports_confirmed_flow(self):
+        source = "def main(){ exec(fetch_url()); }"
+        cfg = AnalysisConfig(
+            external_specs={
+                "fetch_url": ExternalSpec("fetch_url", "读取网络响应", returns="tainted")
+            }
+        )
+        result = analyze_source(source, cfg)
+        self.assertIs(result.verdict, Verdict.UNSAFE)
+        self.assertEqual(result.diagnostics[0].rule, "TAINT-FLOW")
+
+    def test_external_spec_propagate(self):
+        safe_cfg = AnalysisConfig(
+            external_specs={"echo": ExternalSpec("echo", "原样返回实参")}
+        )
+        self.assertIs(
+            analyze_source('def main(){ exec(echo("ls")); }', safe_cfg).verdict,
+            Verdict.SAFE,
+        )
+        unsafe = analyze_source(
+            "def main(){ exec(echo(read_input())); }", safe_cfg
+        )
+        self.assertIs(unsafe.verdict, Verdict.UNSAFE)
+
+    def test_unknown_return_through_sanitized_branch_join(self):
+        # 未知返回值：净化分支与污点分支合流，仍应识别合流后的风险与未知性。
+        source = (
+            "def main(){"
+            " raw = read_input();"
+            " if (1) { v = sanitize(raw); } else { v = get_token(); }"
+            " exec(v);"
+            "}"
+        )
+        result = analyze_source(source)
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+        rules = {d.rule for d in result.diagnostics}
+        self.assertEqual(rules, {"TAINT-UNCERTAIN"})
+        kinds = [h.kind for h in result.diagnostics[0].paths[0].hops]
+        self.assertIn("join", kinds)
+
+    def test_sanitized_branch_vs_tainted_branch_join_still_unsafe(self):
+        source = (
+            "def main(){"
+            " raw = read_input();"
+            " if (1) { v = sanitize(raw); } else { v = raw; }"
+            " exec(v);"
+            "}"
+        )
+        result = analyze_source(source)
+        self.assertIs(result.verdict, Verdict.UNSAFE)
+        self.assertEqual(result.diagnostics[0].rule, "TAINT-FLOW")
+
+    def test_confirmed_and_uncertain_paths_reported_separately(self):
+        source = (
+            "def main(){"
+            " exec(mystery(read_input()));"
+            " exec(get_token());"
+            "}"
+        )
+        result = analyze_source(source)
+        # get_token 无说明使整体结论 INCOMPLETE；已证实风险仍以 TAINT-FLOW 呈现。
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+        rules = {d.rule for d in result.diagnostics}
+        self.assertEqual(rules, {"TAINT-FLOW", "TAINT-UNCERTAIN"})
+        severities = {d.severity for d in result.diagnostics}
+        self.assertEqual(len(severities), 2)
 
 
 if __name__ == "__main__":

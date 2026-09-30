@@ -48,6 +48,31 @@ SINKS = {
     "eval_sql": "危险操作 eval_sql()：以不可信数据拼接 SQL",
 }
 
+#: 无法判定的污点事实类别：未展开调用（递归/深度上限）与缺少说明的外部调用。
+UNCERTAIN_KEYS = ("truncated", "unknown")
+
+
+@dataclass(frozen=True)
+class ExternalSpec:
+    """部分外部调用的受限行为说明（由使用者显式提供，分析器不臆测）。
+
+    返回值策略 ``returns``：
+
+    * ``"clean"``：无论实参如何，返回值视为干净数据（如净化类库函数）；
+    * ``"tainted"``：返回值视为不可信数据（如读网络/环境的库函数）；
+    * ``"propagate"``：仅当任一实参带污点时返回值带污点。
+
+    说明只描述返回值是否携带污点，不替被分析程序执行任何代码。
+    """
+
+    name: str
+    description: str
+    returns: str = "propagate"
+
+    def __post_init__(self) -> None:
+        if self.returns not in ("clean", "tainted", "propagate"):
+            raise ValueError(f"外部调用说明 {self.name} 的返回值策略非法: {self.returns}")
+
 
 @dataclass(frozen=True)
 class Fact:
@@ -67,6 +92,11 @@ Env = dict[str, frozenset[Fact]]
 @dataclass
 class AnalysisConfig:
     max_call_depth: int = 32
+    external_specs: dict[str, ExternalSpec] | None = None
+
+    def __post_init__(self) -> None:
+        if self.external_specs is None:
+            self.external_specs = {}
 
 
 class Analyzer:
@@ -78,6 +108,8 @@ class Analyzer:
         self.notes: list[str] = []
         self.incomplete = False
         self._seen_diag: set[tuple] = set()
+        self._noted_unknown: set[tuple] = set()
+        self._spec_deps: set[str] = set()
 
     # ---------- 对外入口 ----------
 
@@ -88,10 +120,22 @@ class Analyzer:
             entries = [f.name for f in self.program.funcs]
         for name in entries:
             self._analyze_body(self.funcs[name], {}, depth=0, stack=frozenset())
-        if any(d.severity == Severity.ERROR for d in self.diagnostics):
-            verdict = Verdict.UNSAFE
-        elif self.incomplete:
+        if self._spec_deps:
+            used = sorted(self._spec_deps)
+            detail = "; ".join(
+                f"{s.name}(returns={s.returns})"
+                for s in (self.config.external_specs[n] for n in used)
+            )
+            self.notes.append(
+                "本次结论依赖以下外部调用行为说明，说明变化可能改变结论：" + detail
+            )
+        # 结论优先级：分析未完成（递归截断/缺少外部调用说明）时不得超越
+        # INCOMPLETE——即使同一程序里另有已证实的风险路径，该路径仍以
+        # ERROR/TAINT-FLOW 诊断独立呈现，证据链不被未知性吞掉。
+        if self.incomplete:
             verdict = Verdict.INCOMPLETE
+        elif any(d.severity == Severity.ERROR for d in self.diagnostics):
+            verdict = Verdict.UNSAFE
         else:
             verdict = Verdict.SAFE
         return verdict, self.diagnostics, self.notes
@@ -194,14 +238,12 @@ class Analyzer:
 
         if call.func in SINKS:
             tainted = frozenset().union(*arg_facts) if arg_facts else frozenset()
-            truncated = {f for f in tainted if f.key[0] == "truncated"}
-            self._report_sink(call, tainted, bool(truncated))
+            self._report_sink(call, tainted)
             return frozenset()  # sink 无返回值
 
         callee = self.funcs.get(call.func)
         if callee is None:
-            # 未知函数：保守地认为污点参数会从返回值流出（不引入新的污点）。
-            return frozenset().union(*arg_facts) if arg_facts else frozenset()
+            return self._eval_external(call, arg_facts)
 
         # 用户自定义函数：递归/深度上限保护。
         if call.func in stack or depth >= self.config.max_call_depth:
@@ -237,30 +279,104 @@ class Analyzer:
         hop = PathHop(call.loc, "call_out", f"{call.func}() 返回值回到调用处")
         return frozenset(f.extended(hop) for f in returned)
 
+    def _eval_external(
+        self, call: Call, arg_facts: list[frozenset[Fact]]
+    ) -> frozenset[Fact]:
+        """处理用户未定义的外部调用。
+
+        有显式行为说明时严格按说明判定并记录依赖；没有说明时返回值语义
+        未知：既不能当成干净数据（会漏掉真实风险），也不能直接当成已
+        发生的漏洞（缺少依据）。按“无法判定的潜在不可信值”处理，并令
+        整体结论退化为 INCOMPLETE。
+        """
+
+        spec = self.config.external_specs.get(call.func)
+        if spec is not None:
+            self._spec_deps.add(call.func)
+            self.notes.append(
+                f"{call.loc}: 外部调用 {call.func}() 按提供的行为说明 "
+                f"(returns={spec.returns}) 判定：{spec.description}"
+            )
+            if spec.returns == "clean":
+                return frozenset()
+            if spec.returns == "tainted":
+                origin = ("spec_source", call.func, call.loc.line, call.loc.col)
+                hop = PathHop(
+                    call.loc,
+                    "external",
+                    f"外部调用 {call.func}() 按说明视为不可信来源：{spec.description}",
+                )
+                return frozenset({Fact(origin, (hop,))})
+            # propagate：实参污点（含无法判定的事实）原样流出。
+            return frozenset().union(*arg_facts) if arg_facts else frozenset()
+
+        propagated = frozenset().union(*arg_facts) if arg_facts else frozenset()
+        confirmed = frozenset(f for f in propagated if f.key[0] not in UNCERTAIN_KEYS)
+        note_key = (call.func, call.loc.line, call.loc.col)
+        if confirmed and note_key not in self._noted_unknown:
+            self._noted_unknown.add(note_key)
+            # 实参已带已证实污点：保守沿用“数据可能原样流出”的约定，
+            # 已证实路径继续报 TAINT-FLOW；函数是否还会凭空产生新数据
+            # 无从得知，但不改变该已证实证据链的保守方向（宁可误报）。
+            self.notes.append(
+                f"{call.loc}: 外部调用 {call.func}() 缺少行为说明，"
+                f"已污点实参按可能原样流出保守追踪"
+            )
+        if confirmed:
+            return propagated
+
+        self.incomplete = True
+        if note_key not in self._noted_unknown:
+            self.notes.append(
+                f"{call.loc}: 外部调用 {call.func}() 缺少行为说明，返回值语义未知，"
+                f"按无法判定（潜在不可信）处理；分析不能据此给出安全结论"
+            )
+            self._noted_unknown.add(note_key)
+        key = ("unknown", call.func, call.loc.line, call.loc.col)
+        hop = PathHop(
+            call.loc,
+            "unknown",
+            f"外部调用 {call.func}() 语义未知（缺少行为说明），返回值按潜在不可信处理",
+        )
+        unknown_fact = Fact(key, (hop,))
+        # 实参中无法判定的事实仍保留并继续传播，同时附上“返回值语义未知”。
+        return propagated | frozenset({unknown_fact})
+
     # ---------- 诊断 ----------
 
-    def _report_sink(self, call: Call, facts: frozenset[Fact], truncated: bool) -> None:
+    def _report_sink(self, call: Call, facts: frozenset[Fact]) -> None:
         if not facts:
             return
-        paths = tuple(TaintPath(f.path + (PathHop(call.loc, "sink", f"流入 {call.func}()"),)) for f in facts)
-        dedup_key = (call.func, call.loc.line, call.loc.col, tuple(p.hops for p in paths))
-        if dedup_key in self._seen_diag:
-            return
-        self._seen_diag.add(dedup_key)
-        severity = Severity.WARNING if truncated else Severity.ERROR
-        rule = "TAINT-UNCERTAIN" if truncated else "TAINT-FLOW"
-        self.diagnostics.append(
-            Diagnostic(
-                severity=severity,
-                message=SINKS[call.func],
-                loc=call.loc,
-                sink=call.func,
-                paths=paths,
-                rule=rule,
+        # 已确认的污点事实与无法判定的事实分开报告：
+        # 已确认 -> ERROR/TAINT-FLOW；无法判定 -> WARNING/TAINT-UNCERTAIN。
+        confirmed = frozenset(f for f in facts if f.key[0] not in UNCERTAIN_KEYS)
+        uncertain = frozenset(f for f in facts if f.key[0] in UNCERTAIN_KEYS)
+        for group, severity, rule, suffix in (
+            (confirmed, Severity.ERROR, "TAINT-FLOW", "不可信数据"),
+            (uncertain, Severity.WARNING, "TAINT-UNCERTAIN", "无法判定是否干净的数据"),
+        ):
+            if not group:
+                continue
+            paths = tuple(
+                TaintPath(f.path + (PathHop(call.loc, "sink", f"{suffix}流入 {call.func}()"),))
+                for f in group
             )
-        )
-        if truncated:
-            self.incomplete = True
+            dedup_key = (rule, call.func, call.loc.line, call.loc.col, tuple(p.hops for p in paths))
+            if dedup_key in self._seen_diag:
+                continue
+            self._seen_diag.add(dedup_key)
+            self.diagnostics.append(
+                Diagnostic(
+                    severity=severity,
+                    message=SINKS[call.func],
+                    loc=call.loc,
+                    sink=call.func,
+                    paths=paths,
+                    rule=rule,
+                )
+            )
+            if severity is Severity.WARNING:
+                self.incomplete = True
 
 
 def analyze_program(program: Program, config: AnalysisConfig | None = None):
