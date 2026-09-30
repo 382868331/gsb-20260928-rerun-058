@@ -51,6 +51,9 @@ class AnalysisResult:
     verdict: Verdict
     diagnostics: list[Diagnostic]
     notes: list[str]
+    # 结论依赖的外部行为说明（没有说明的未知调用不会出现在这里，
+    # 而是让结论变成 INCOMPLETE）。
+    assumptions: list[str] = None
 
     def format_text(self) -> str:
         lines = [f"分析结论: {self.verdict.value}"]
@@ -61,4 +64,6 @@ class AnalysisResult:
                     lines.append(f"    {hop.loc}  [{hop.kind}] {hop.text}")
         for note in self.notes:
             lines.append(f"NOTE: {note}")
+        for assumption in self.assumptions or []:
+            lines.append(f"ASSUMPTION: {assumption}")
         return "\n".join(lines)

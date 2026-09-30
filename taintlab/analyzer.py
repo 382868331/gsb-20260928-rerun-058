@@ -11,6 +11,10 @@
 * 递归/深度：沿调用栈分析，遇到递归或达到 ``max_call_depth`` 时停止展开，
   该次调用按“潜在不可信”处理并给出 WARNING；只要有未分析完的部分，
   最终结论只能是 INCOMPLETE，绝不判 SAFE。
+* 未知外部函数：没有行为说明（external spec）的调用，其返回值**不是**干净数据，
+  而是“未知来源”的不确定事实；该调用本身也让分析标记为 INCOMPLETE。
+  可通过 ``AnalysisConfig.external_specs`` 为部分外部调用提供受限行为说明
+  （clean / tainted / propagate），结论会记录依赖了哪些说明。
 """
 
 from __future__ import annotations
@@ -48,6 +52,15 @@ SINKS = {
     "eval_sql": "危险操作 eval_sql()：以不可信数据拼接 SQL",
 }
 
+# 允许为外部调用提供的受限行为说明：
+#   clean     —— 返回值保证干净（不携带任何污点）；
+#   tainted   —— 返回值视为不可信（相当于一个 source）；
+#   propagate —— 实参污点会保守地传播到返回值（不引入新污点）。
+EXTERNAL_BEHAVIORS = ("clean", "tainted", "propagate")
+
+# 表示“不确定”的污点事实来源类别：到达 sink 时只能给 WARNING，结论为 INCOMPLETE。
+UNCERTAIN_ORIGINS = ("truncated", "unknown")
+
 
 @dataclass(frozen=True)
 class Fact:
@@ -67,6 +80,18 @@ Env = dict[str, frozenset[Fact]]
 @dataclass
 class AnalysisConfig:
     max_call_depth: int = 32
+    # 外部函数行为说明：函数名 -> "clean" | "tainted" | "propagate"。
+    external_specs: dict[str, str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.external_specs is None:
+            self.external_specs = {}
+        for name, behavior in self.external_specs.items():
+            if behavior not in EXTERNAL_BEHAVIORS:
+                raise ValueError(
+                    f"外部函数 {name} 的行为说明 {behavior!r} 无效，"
+                    f"只允许: {', '.join(EXTERNAL_BEHAVIORS)}"
+                )
 
 
 class Analyzer:
@@ -76,12 +101,14 @@ class Analyzer:
         self.funcs: dict[str, FuncDef] = {f.name: f for f in program.funcs}
         self.diagnostics: list[Diagnostic] = []
         self.notes: list[str] = []
+        self.assumptions: list[str] = []
         self.incomplete = False
         self._seen_diag: set[tuple] = set()
+        self._seen_assumption: set[str] = set()
 
     # ---------- 对外入口 ----------
 
-    def run(self) -> tuple[Verdict, list[Diagnostic], list[str]]:
+    def run(self) -> tuple[Verdict, list[Diagnostic], list[str], list[str]]:
         entries = [f.name for f in self.program.funcs if f.name == "main"]
         if not entries:
             # 没有 main 时每个函数都当作可能的入口，形参按干净数据处理。
@@ -94,7 +121,7 @@ class Analyzer:
             verdict = Verdict.INCOMPLETE
         else:
             verdict = Verdict.SAFE
-        return verdict, self.diagnostics, self.notes
+        return verdict, self.diagnostics, self.notes, self.assumptions
 
     # ---------- 语句 ----------
 
@@ -194,14 +221,12 @@ class Analyzer:
 
         if call.func in SINKS:
             tainted = frozenset().union(*arg_facts) if arg_facts else frozenset()
-            truncated = {f for f in tainted if f.key[0] == "truncated"}
-            self._report_sink(call, tainted, bool(truncated))
+            self._report_sink(call, tainted)
             return frozenset()  # sink 无返回值
 
         callee = self.funcs.get(call.func)
         if callee is None:
-            # 未知函数：保守地认为污点参数会从返回值流出（不引入新的污点）。
-            return frozenset().union(*arg_facts) if arg_facts else frozenset()
+            return self._eval_external_call(call, arg_facts)
 
         # 用户自定义函数：递归/深度上限保护。
         if call.func in stack or depth >= self.config.max_call_depth:
@@ -237,18 +262,56 @@ class Analyzer:
         hop = PathHop(call.loc, "call_out", f"{call.func}() 返回值回到调用处")
         return frozenset(f.extended(hop) for f in returned)
 
+    # ---------- 外部（未知语义）调用 ----------
+
+    def _eval_external_call(self, call: Call, arg_facts: list[frozenset[Fact]]) -> frozenset[Fact]:
+        behavior = (self.config.external_specs or {}).get(call.func)
+        if behavior is not None:
+            self._record_assumption(call, behavior)
+            if behavior == "clean":
+                return frozenset()
+            if behavior == "tainted":
+                origin = ("external", call.func, call.loc.line, call.loc.col)
+                hop = PathHop(call.loc, "source", f"外部调用 {call.func}() 按说明视为不可信来源")
+                return frozenset({Fact(origin, (hop,))})
+            # propagate：实参污点保守地传到返回值，不引入新污点。
+            return frozenset().union(*arg_facts) if arg_facts else frozenset()
+
+        # 没有行为说明的未知调用：分析无法完整，返回值按“未知来源”处理，
+        # 既不是干净数据，也不直接当作已确认污点。
+        self.incomplete = True
+        self.notes.append(
+            f"{call.loc}: 未知外部调用 {call.func}() 缺少行为说明，"
+            f"返回值按未知来源处理，结论不得判 SAFE"
+        )
+        facts = frozenset().union(*arg_facts) if arg_facts else frozenset()
+        origin = ("unknown", call.func, call.loc.line, call.loc.col)
+        hop = PathHop(call.loc, "unknown", f"未知外部调用 {call.func}() 的返回值（语义不明）")
+        return facts | {Fact(origin, (hop,))}
+
+    def _record_assumption(self, call: Call, behavior: str) -> None:
+        if call.func in self._seen_assumption:
+            return
+        self._seen_assumption.add(call.func)
+        text = f"外部调用 {call.func}() 按调用方提供的行为说明 {behavior!r} 处理"
+        self.assumptions.append(text)
+        self.notes.append(f"{call.loc}: {text}")
+
     # ---------- 诊断 ----------
 
-    def _report_sink(self, call: Call, facts: frozenset[Fact], truncated: bool) -> None:
+    def _report_sink(self, call: Call, facts: frozenset[Fact]) -> None:
         if not facts:
             return
+        # 只要路径里混入不确定事实（未知调用/截断），就不把它报成已确认漏洞：
+        # 诊断降级为 WARNING，整体结论只能是 INCOMPLETE。
+        uncertain = any(f.key[0] in UNCERTAIN_ORIGINS for f in facts)
         paths = tuple(TaintPath(f.path + (PathHop(call.loc, "sink", f"流入 {call.func}()"),)) for f in facts)
         dedup_key = (call.func, call.loc.line, call.loc.col, tuple(p.hops for p in paths))
         if dedup_key in self._seen_diag:
             return
         self._seen_diag.add(dedup_key)
-        severity = Severity.WARNING if truncated else Severity.ERROR
-        rule = "TAINT-UNCERTAIN" if truncated else "TAINT-FLOW"
+        severity = Severity.WARNING if uncertain else Severity.ERROR
+        rule = "TAINT-UNCERTAIN" if uncertain else "TAINT-FLOW"
         self.diagnostics.append(
             Diagnostic(
                 severity=severity,
@@ -259,16 +322,16 @@ class Analyzer:
                 rule=rule,
             )
         )
-        if truncated:
+        if uncertain:
             self.incomplete = True
 
 
 def analyze_program(program: Program, config: AnalysisConfig | None = None):
     analyzer = Analyzer(program, config or AnalysisConfig())
-    verdict, diagnostics, notes = analyzer.run()
+    verdict, diagnostics, notes, assumptions = analyzer.run()
     from .model import AnalysisResult
 
-    return AnalysisResult(verdict=verdict, diagnostics=diagnostics, notes=notes)
+    return AnalysisResult(verdict=verdict, diagnostics=diagnostics, notes=notes, assumptions=assumptions)
 
 
 def analyze_source(source: str, config: AnalysisConfig | None = None) -> "AnalysisResult":
@@ -284,5 +347,6 @@ def analyze_source(source: str, config: AnalysisConfig | None = None) -> "Analys
                 Diagnostic(Severity.ERROR, str(exc), loc, sink="", rule="PARSE")
             ],
             notes=[],
+            assumptions=[],
         )
     return analyze_program(program, config)

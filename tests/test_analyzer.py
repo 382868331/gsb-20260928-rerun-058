@@ -169,9 +169,95 @@ class TaintAnalysisTests(unittest.TestCase):
             parse("def main(){ x = @; }")
 
     def test_unknown_function_propagates_taint_conservatively(self):
+        # 无说明的未知调用：实参污点仍保守传播到返回值，但调用本身语义未知，
+        # 结论只能是 INCOMPLETE（诊断含确认污点路径，但整体不夸大为已确认漏洞）。
         source = "def main(){ exec(mystery(read_input())); }"
         result = analyze_source(source)
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+        self.assertTrue(any(d.severity == Severity.WARNING for d in result.diagnostics))
+        kinds = [h.kind for h in result.diagnostics[0].paths[0].hops]
+        self.assertIn("source", kinds)
+
+    def test_unknown_zero_arg_return_is_not_clean(self):
+        # 未知函数无参调用的返回值不能当作干净数据。
+        source = "def main(){ x = mystery(); exec(x); }"
+        result = analyze_source(source)
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+        self.assertEqual(len(result.diagnostics), 1)
+        self.assertEqual(result.diagnostics[0].severity, Severity.WARNING)
+        self.assertEqual(result.diagnostics[0].rule, "TAINT-UNCERTAIN")
+        kinds = [h.kind for h in result.diagnostics[0].paths[0].hops]
+        self.assertEqual(kinds, ["unknown", "assign", "sink"])
+        self.assertTrue(any("缺少行为说明" in note for note in result.notes))
+
+    def test_unknown_call_without_spec_never_safe(self):
+        # 即使返回值没有流入 sink，缺少说明的未知调用也不得判 SAFE。
+        source = 'def main(){ mystery(); exec("ls"); }'
+        result = analyze_source(source)
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+        self.assertEqual(result.diagnostics, [])
+
+    def test_unknown_return_sanitized_branch_join_still_incomplete(self):
+        # 未知返回值经净化、分支汇合后 sink 无污点，但未知调用本身
+        # 缺少说明，结论仍不得是无依据的 SAFE。
+        source = (
+            "def main(){"
+            " x = mystery();"
+            " y = sanitize(x);"
+            " if (1 == 1) { z = y; } else { z = \"c\"; }"
+            " exec(z);"
+            "}"
+        )
+        result = analyze_source(source)
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+        self.assertEqual(result.diagnostics, [])
+
+    def test_unknown_return_with_taint_join_at_sink(self):
+        # 未知返回值与确认污点在分支汇合后一起到达 sink：
+        # 路径混入不确定事实，不夸大为已确认漏洞：WARNING + INCOMPLETE。
+        source = (
+            "def main(){"
+            " a = read_input();"
+            " b = mystery();"
+            " if (1 == 1) { z = a; } else { z = b; }"
+            " exec(z);"
+            "}"
+        )
+        result = analyze_source(source)
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+        self.assertTrue(any(d.severity == Severity.WARNING for d in result.diagnostics))
+
+    def test_external_spec_clean_allows_safe_and_records_assumption(self):
+        source = "def main(){ x = mystery(); exec(x); }"
+        result = analyze_source(
+            source, AnalysisConfig(external_specs={"mystery": "clean"})
+        )
+        self.assertIs(result.verdict, Verdict.SAFE)
+        self.assertEqual(result.diagnostics, [])
+        self.assertEqual(len(result.assumptions), 1)
+        self.assertIn("mystery", result.assumptions[0])
+        self.assertIn("clean", result.assumptions[0])
+
+    def test_external_spec_tainted_reports_flow(self):
+        source = "def main(){ x = mystery(); exec(x); }"
+        result = analyze_source(
+            source, AnalysisConfig(external_specs={"mystery": "tainted"})
+        )
         self.assertIs(result.verdict, Verdict.UNSAFE)
+        self.assertEqual(result.diagnostics[0].rule, "TAINT-FLOW")
+        self.assertTrue(result.assumptions)
+
+    def test_external_spec_propagate_keeps_conservative_taint(self):
+        source = "def main(){ exec(mystery(read_input())); }"
+        result = analyze_source(
+            source, AnalysisConfig(external_specs={"mystery": "propagate"})
+        )
+        self.assertIs(result.verdict, Verdict.UNSAFE)
+        self.assertTrue(result.assumptions)
+
+    def test_external_spec_invalid_behavior_rejected(self):
+        with self.assertRaises(ValueError):
+            AnalysisConfig(external_specs={"mystery": "magic"})
 
 
 if __name__ == "__main__":

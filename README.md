@@ -30,6 +30,14 @@ def 函数名(参数, ...) { 语句; ... }
 - **递归与深度上限**：沿调用栈检测递归，`AnalysisConfig.max_call_depth`
   （默认 32）限制展开深度；触顶的调用按“潜在不可信”处理并产生
   `TAINT-UNCERTAIN` 警告，整体结论为 `INCOMPLETE` —— 未分析完绝不报 `SAFE`。
+- **未知外部调用**：没有行为说明的外部函数（如无参的 `fetch_remote()`），
+  其返回值**不是**干净数据，而是“未知来源”的不确定事实；该调用本身也让
+  分析标记为 `INCOMPLETE`。不确定事实到达 sink 只产生 `TAINT-UNCERTAIN`
+  警告，不会夸大为已确认漏洞，也绝不输出无依据的 `SAFE`。
+- **外部行为说明**：可通过 `AnalysisConfig(external_specs={"foo": "clean"})`
+  或 CLI `--external foo=clean` 为部分外部调用提供受限说明
+  （`clean` 返回干净 / `tainted` 返回不可信 / `propagate` 实参污点传到返回值）。
+  结论依赖的每条说明都会记录在结果的 `assumptions` 中（输出为 `ASSUMPTION:` 行）。
 
 结论取值：`UNSAFE`（污点到达 sink）/ `INCOMPLETE`（分析未完成）/
 `SAFE`（完整分析且无污点流）/ `PARSE_ERROR`。
@@ -41,6 +49,8 @@ python -m taintlab examples/vulnerable.tl   # 反例：UNSAFE
 python -m taintlab examples/sanitized.tl    # 净化值安全、原值报警
 python -m taintlab examples/branch_join.tl  # 分支汇合
 python -m taintlab examples/recursion.tl    # INCOMPLETE
+python -m taintlab examples/unknown_return.tl                 # 未知返回：INCOMPLETE
+python -m taintlab --external fetch_remote=clean examples/unknown_return.tl  # 有说明：SAFE
 python -m unittest discover -s tests        # 自带正反例测试
 ```
 

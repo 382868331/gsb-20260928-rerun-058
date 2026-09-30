@@ -10,7 +10,7 @@ from .model import (
     TaintPath,
     Verdict,
 )
-from .analyzer import analyze_source, analyze_program, AnalysisConfig
+from .analyzer import EXTERNAL_BEHAVIORS, analyze_source, analyze_program, AnalysisConfig
 from .parser import parse
 from .lexer import LexerError
 from .parser import ParseError
@@ -19,6 +19,7 @@ __all__ = [
     "analyze_source",
     "analyze_program",
     "AnalysisConfig",
+    "EXTERNAL_BEHAVIORS",
     "AnalysisResult",
     "Diagnostic",
     "Severity",

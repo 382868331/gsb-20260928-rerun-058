@@ -1,7 +1,7 @@
 import argparse
 import sys
 
-from .analyzer import AnalysisConfig, analyze_source
+from .analyzer import EXTERNAL_BEHAVIORS, AnalysisConfig, analyze_source
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -13,7 +13,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-depth", type=int, default=32, help="跨函数分析的最大调用深度（默认 32）"
     )
+    parser.add_argument(
+        "--external",
+        action="append",
+        default=[],
+        metavar="NAME=BEHAVIOR",
+        help="为外部调用提供行为说明，BEHAVIOR 取 "
+        + "/".join(EXTERNAL_BEHAVIORS)
+        + "；可重复。未说明的未知调用不会得出 SAFE 结论",
+    )
     args = parser.parse_args(argv)
+
+    external_specs: dict[str, str] = {}
+    for item in args.external:
+        name, sep, behavior = item.partition("=")
+        if not sep or not name:
+            parser.error(f"--external 参数格式应为 NAME=BEHAVIOR，收到: {item!r}")
+        external_specs[name] = behavior
 
     if args.file == "-":
         source = sys.stdin.read()
@@ -21,7 +37,10 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.file, "r", encoding="utf-8") as fh:
             source = fh.read()
 
-    result = analyze_source(source, AnalysisConfig(max_call_depth=args.max_depth))
+    result = analyze_source(
+        source,
+        AnalysisConfig(max_call_depth=args.max_depth, external_specs=external_specs),
+    )
     print(result.format_text())
     if result.verdict.value == "PARSE_ERROR":
         return 2
