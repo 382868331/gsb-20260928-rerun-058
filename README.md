@@ -31,25 +31,38 @@ def 函数名(参数, ...) { 语句; ... }
   （默认 32）限制展开深度；触顶的调用按“潜在不可信”处理并产生
   `TAINT-UNCERTAIN` 警告，整体结论为 `INCOMPLETE` —— 未分析完绝不报 `SAFE`。
 - **未知外部调用**：程序中调用了既非内置、又未在程序内定义的函数时，
-  分析器**不臆测**其语义：
-  - 实参已带污点时，保守按“数据可能原样流出”追踪（已证实证据链，
-    `TAINT-FLOW`）；
-  - 无实参或实参本身无法判定时，返回值是语义未知的“潜在不可信值”，
-    携带 `unknown` 路径跳；它流入 sink 产生 `TAINT-UNCERTAIN` 警告，
-    程序中只要出现这种无说明调用，结论只能是 `INCOMPLETE`，
-    **绝不输出无依据的 `SAFE`，也不把未知调用直接报成已发生的漏洞**。
+  分析器**不臆测**其语义。外部函数可能净化、忽略或改变实参，因此保守传播
+  只能说明风险**尚不能排除**，不能冒充已经证实的路径：
+  - 无论无参还是带参，也无论实参是否已带污点，缺少说明的外部调用返回值
+    一律是“无法判断的潜在不可信值”，在调用处产生 `unknown` 路径跳；带污点
+    实参时，`source -> ... -> unknown -> sink` 的完整调用链作为**背景保留**，
+    但依据在 `unknown` 处降级；
+  - 该值流入 sink 产生 `TAINT-UNCERTAIN`（warning，依据 `unknown`），程序中
+    只要出现无说明的外部调用（即使返回值未被使用），结论只能是
+    `INCOMPLETE`；**绝不输出无依据的 `SAFE`，也不把未知调用报成已发生的
+    漏洞**。常量等已证实安全的路径不会因此产生报警。
 - **受限行为说明**：可通过 `AnalysisConfig(external_specs=...)` 为部分外部
   调用提供说明 `ExternalSpec(name, description, returns)`，`returns` 取：
   `"clean"`（返回值干净）/ `"tainted"`（视为不可信来源）/
-  `"propagate"`（污点随实参传播，默认）。分析结果的 notes 会记录结论依赖了
-  哪些说明——说明变化，结论可能随之变化。
+  `"propagate"`（污点随实参传播，默认）。依赖说明才成立的路径诊断为
+  `TAINT-ASSUMED`（warning，依据 `assumption`，诊断上记录所依赖的说明名），
+  整体结论为 `ASSUMED_UNSAFE`；结果的 `assumptions_used` 与 notes 记录本次
+  实际依赖了哪些说明。
 
-已证实风险与无法判定的路径**分开诊断**：`TAINT-FLOW`（error）与
-`TAINT-UNCERTAIN`（warning）互不吞没；只要存在未完成判断，结论为
-`INCOMPLETE`（即使同时存在已证实风险路径，该路径仍完整呈现）。
+结论依据分三档并**分开诊断**：已证实（`TAINT-FLOW`/error/basis=confirmed）、
+依赖假设（`TAINT-ASSUMED`/warning/basis=assumption）、无法判断
+（`TAINT-UNCERTAIN`/warning/basis=unknown），三者互不吞没。每条诊断都携带
+完整调用链；用户可在文本报告中直接查看使结论成立的调用链与假设。
 
-结论取值：`UNSAFE`（污点到达 sink）/ `INCOMPLETE`（分析未完成）/
-`SAFE`（完整分析且无污点流）/ `PARSE_ERROR`。
+**说明版本比较**：`compare_spec_versions(source, 旧配置, 新配置)` 返回
+`VersionDiff`，逐项列出结论变化及受影响 sink 的旧/新调用链与假设：
+- 某项说明被撤回后，**只有依赖它的诊断**失效（`assumption -> unknown`）；
+  不依赖它的已证实 `TAINT-FLOW` 路径与常量安全路径保持不变；
+- 说明被修改（如 `clean -> tainted`）时仅受影响 sink 出现在变化列表中。
+
+结论取值：`UNSAFE`（已证实污点到达 sink）/ `ASSUMED_UNSAFE`（风险路径依赖
+外部说明）/ `INCOMPLETE`（存在无法判断的部分）/ `SAFE`（完整分析且无污点流）/
+`PARSE_ERROR`。
 
 ## 使用
 

@@ -10,7 +10,15 @@ from .model import (
     TaintPath,
     Verdict,
 )
-from .analyzer import analyze_source, analyze_program, AnalysisConfig, ExternalSpec
+from .analyzer import (
+    analyze_source,
+    analyze_program,
+    compare_spec_versions,
+    AnalysisConfig,
+    DiagnosticChange,
+    ExternalSpec,
+    VersionDiff,
+)
 from .parser import parse
 from .lexer import LexerError
 from .parser import ParseError
@@ -22,9 +30,12 @@ __all__ = [
     "AnalysisResult",
     "ExternalSpec",
     "Diagnostic",
+    "DiagnosticChange",
     "Severity",
     "TaintPath",
     "Verdict",
+    "VersionDiff",
+    "compare_spec_versions",
     "parse",
     "LexerError",
     "ParseError",
