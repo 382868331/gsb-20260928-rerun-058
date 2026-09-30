@@ -9,8 +9,11 @@
 * 分支：分别分析两个分支，汇合时对变量做并集（保守地认为任一分支
   赋值都可能发生），并记录一条 join 路径跳。
 * 递归/深度：沿调用栈分析，遇到递归或达到 ``max_call_depth`` 时停止展开，
-  该次调用按“潜在不可信”处理并给出 WARNING；只要有未分析完的部分，
+  该次调用按 UNKNOWN 事实处理并给出 WARNING；只要有未分析完的部分，
   最终结论只能是 INCOMPLETE，绝不判 SAFE。
+* 外部调用：缺少行为说明时，不把返回值当干净值，也不把它流到 sink 当作
+  已证实漏洞；统一标为 UNKNOWN。提供说明后，由说明推出的事实标为 ASSUMED，
+  调用位置、版本和完整路径随假设记录输出。
 """
 
 from __future__ import annotations
@@ -33,7 +36,15 @@ from .ast_nodes import (
     Var,
 )
 from .locations import Loc
-from .model import Diagnostic, PathHop, Severity, TaintPath, Verdict
+from .model import (
+    AssumptionRecord,
+    Diagnostic,
+    Evidence,
+    PathHop,
+    Severity,
+    TaintPath,
+    Verdict,
+)
 from .parser import parse
 
 # 内置函数建模：整个分析过程不执行任何被分析代码。
@@ -47,10 +58,6 @@ SINKS = {
     "exec": "危险操作 exec()：以不可信数据执行命令",
     "eval_sql": "危险操作 eval_sql()：以不可信数据拼接 SQL",
 }
-
-#: 无法判定的污点事实类别：未展开调用（递归/深度上限）与缺少说明的外部调用。
-UNCERTAIN_KEYS = ("truncated", "unknown")
-
 
 @dataclass(frozen=True)
 class ExternalSpec:
@@ -68,6 +75,7 @@ class ExternalSpec:
     name: str
     description: str
     returns: str = "propagate"
+    version: str | None = None
 
     def __post_init__(self) -> None:
         if self.returns not in ("clean", "tainted", "propagate"):
@@ -80,9 +88,83 @@ class Fact:
 
     key: tuple
     path: tuple[PathHop, ...]
+    evidence: Evidence = Evidence.CONFIRMED
+    assumptions: frozenset[str] = frozenset()
 
     def extended(self, hop: PathHop) -> "Fact":
         return replace(self, path=self.path + (hop,))
+
+    def with_evidence(
+        self,
+        evidence: Evidence,
+        assumptions: frozenset[str] | None = None,
+    ) -> "Fact":
+        return replace(
+            self,
+            evidence=evidence,
+            assumptions=self.assumptions | (assumptions or frozenset()),
+        )
+
+
+@dataclass(frozen=True)
+class SpecVersionChange:
+    name: str
+    status: str
+    old_version: str | None = None
+    new_version: str | None = None
+    changed_fields: tuple[str, ...] = ()
+
+    @property
+    def invalidated_assumptions(self) -> tuple[str, ...]:
+        if self.status not in ("changed", "withdrawn"):
+            return ()
+        return (spec_assumption_id(self.name, self.old_version),)
+
+
+def spec_assumption_id(name: str, version: str | None) -> str:
+    return f"{name}@{version}" if version is not None else name
+
+
+def compare_external_specs(
+    old_specs: dict[str, ExternalSpec] | None,
+    new_specs: dict[str, ExternalSpec] | None,
+) -> list[SpecVersionChange]:
+    """比较两版外部行为说明；撤回只返回被撤回名称对应的假设 ID。"""
+
+    old_specs = old_specs or {}
+    new_specs = new_specs or {}
+    changes: list[SpecVersionChange] = []
+    for name in sorted(set(old_specs) | set(new_specs)):
+        old = old_specs.get(name)
+        new = new_specs.get(name)
+        if old is None:
+            changes.append(SpecVersionChange(name, "added", new_version=new.version))
+            continue
+        if new is None:
+            changes.append(
+                SpecVersionChange(name, "withdrawn", old_version=old.version)
+            )
+            continue
+        changed_fields = tuple(
+            field
+            for field in ("version", "returns", "description")
+            if getattr(old, field) != getattr(new, field)
+        )
+        if changed_fields:
+            changes.append(
+                SpecVersionChange(
+                    name,
+                    "changed",
+                    old.version,
+                    new.version,
+                    changed_fields,
+                )
+            )
+        else:
+            changes.append(
+                SpecVersionChange(name, "unchanged", old.version, new.version)
+            )
+    return changes
 
 
 # 变量环境：变量名 -> 该变量当前携带的污点事实集合（空集合 = 干净）。
@@ -110,35 +192,74 @@ class Analyzer:
         self._seen_diag: set[tuple] = set()
         self._noted_unknown: set[tuple] = set()
         self._spec_deps: set[str] = set()
+        self._spec_uses: dict[str, dict] = {}
 
     # ---------- 对外入口 ----------
 
-    def run(self) -> tuple[Verdict, list[Diagnostic], list[str]]:
+    def run(
+        self,
+    ) -> tuple[
+        Verdict,
+        list[Diagnostic],
+        list[str],
+        tuple[AssumptionRecord, ...],
+    ]:
         entries = [f.name for f in self.program.funcs if f.name == "main"]
         if not entries:
             # 没有 main 时每个函数都当作可能的入口，形参按干净数据处理。
             entries = [f.name for f in self.program.funcs]
         for name in entries:
             self._analyze_body(self.funcs[name], {}, depth=0, stack=frozenset())
-        if self._spec_deps:
-            used = sorted(self._spec_deps)
-            detail = "; ".join(
-                f"{s.name}(returns={s.returns})"
-                for s in (self.config.external_specs[n] for n in used)
-            )
-            self.notes.append(
-                "本次结论依赖以下外部调用行为说明，说明变化可能改变结论：" + detail
-            )
-        # 结论优先级：分析未完成（递归截断/缺少外部调用说明）时不得超越
-        # INCOMPLETE——即使同一程序里另有已证实的风险路径，该路径仍以
-        # ERROR/TAINT-FLOW 诊断独立呈现，证据链不被未知性吞掉。
+        assumptions = self._build_assumptions()
         if self.incomplete:
             verdict = Verdict.INCOMPLETE
-        elif any(d.severity == Severity.ERROR for d in self.diagnostics):
+        elif any(
+            d.evidence == Evidence.CONFIRMED and d.severity == Severity.ERROR
+            for d in self.diagnostics
+        ):
             verdict = Verdict.UNSAFE
+        elif assumptions or any(
+            d.evidence == Evidence.ASSUMED for d in self.diagnostics
+        ):
+            verdict = Verdict.ASSUMED
         else:
             verdict = Verdict.SAFE
-        return verdict, self.diagnostics, self.notes
+        return verdict, self.diagnostics, self.notes, assumptions
+
+    def _build_assumptions(self) -> tuple[AssumptionRecord, ...]:
+        records = []
+        for assumption_id in sorted(self._spec_uses):
+            use = self._spec_uses[assumption_id]
+            spec = use["spec"]
+            records.append(
+                AssumptionRecord(
+                    assumption_id=assumption_id,
+                    name=spec.name,
+                    version=spec.version,
+                    returns=spec.returns,
+                    description=spec.description,
+                    locations=tuple(use["locations"]),
+                    paths=tuple(use["paths"]),
+                )
+            )
+        return tuple(records)
+
+    def _record_spec_use(
+        self,
+        spec: ExternalSpec,
+        loc: Loc,
+        paths: tuple[TaintPath, ...] = (),
+    ) -> str:
+        assumption_id = spec_assumption_id(spec.name, spec.version)
+        use = self._spec_uses.setdefault(
+            assumption_id,
+            {"spec": spec, "locations": [], "paths": []},
+        )
+        if loc not in use["locations"]:
+            use["locations"].append(loc)
+        use["paths"].extend(paths)
+        self._spec_deps.add(spec.name)
+        return assumption_id
 
     # ---------- 语句 ----------
 
@@ -256,7 +377,7 @@ class Analyzer:
             self.notes.append(f"{call.loc}: {reason}，该调用结果按潜在不可信处理")
             key = ("truncated", call.func, depth, call.loc.line, call.loc.col)
             hop = PathHop(call.loc, "truncated", reason + "（按潜在不可信处理）")
-            return frozenset({Fact(key, (hop,))})
+            return frozenset({Fact(key, (hop,), evidence=Evidence.UNKNOWN)})
 
         if len(call.args) != len(callee.params):
             self.incomplete = True
@@ -265,7 +386,7 @@ class Analyzer:
             )
             key = ("truncated", call.func, depth, call.loc.line, call.loc.col)
             hop = PathHop(call.loc, "truncated", "参数个数不符，调用未展开（按潜在不可信处理）")
-            return frozenset({Fact(key, (hop,))})
+            return frozenset({Fact(key, (hop,), evidence=Evidence.UNKNOWN)})
 
         # 绑定形参：把调用点位置记录为 call_in 一跳。
         callee_env: Env = {}
@@ -290,12 +411,25 @@ class Analyzer:
         整体结论退化为 INCOMPLETE。
         """
 
+        propagated = frozenset().union(*arg_facts) if arg_facts else frozenset()
         spec = self.config.external_specs.get(call.func)
         if spec is not None:
-            self._spec_deps.add(call.func)
+            external_hop = PathHop(
+                call.loc,
+                "external",
+                "外部调用 "
+                f"{call.func}() 按说明 "
+                f"{spec_assumption_id(spec.name, spec.version)} 判定",
+            )
+            incoming_paths = tuple(
+                TaintPath(f.path + (external_hop,))
+                for facts in arg_facts
+                for f in facts
+            )
+            assumption_id = self._record_spec_use(spec, call.loc, incoming_paths)
             self.notes.append(
                 f"{call.loc}: 外部调用 {call.func}() 按提供的行为说明 "
-                f"(returns={spec.returns}) 判定：{spec.description}"
+                f"({assumption_id}, returns={spec.returns}) 判定：{spec.description}"
             )
             if spec.returns == "clean":
                 return frozenset()
@@ -306,62 +440,91 @@ class Analyzer:
                     "external",
                     f"外部调用 {call.func}() 按说明视为不可信来源：{spec.description}",
                 )
-                return frozenset({Fact(origin, (hop,))})
-            # propagate：实参污点（含无法判定的事实）原样流出。
-            return frozenset().union(*arg_facts) if arg_facts else frozenset()
-
-        propagated = frozenset().union(*arg_facts) if arg_facts else frozenset()
-        confirmed = frozenset(f for f in propagated if f.key[0] not in UNCERTAIN_KEYS)
-        note_key = (call.func, call.loc.line, call.loc.col)
-        if confirmed and note_key not in self._noted_unknown:
-            self._noted_unknown.add(note_key)
-            # 实参已带已证实污点：保守沿用“数据可能原样流出”的约定，
-            # 已证实路径继续报 TAINT-FLOW；函数是否还会凭空产生新数据
-            # 无从得知，但不改变该已证实证据链的保守方向（宁可误报）。
-            self.notes.append(
-                f"{call.loc}: 外部调用 {call.func}() 缺少行为说明，"
-                f"已污点实参按可能原样流出保守追踪"
-            )
-        if confirmed:
-            return propagated
+                return frozenset(
+                    {
+                        Fact(
+                            origin,
+                            (hop,),
+                            evidence=Evidence.ASSUMED,
+                            assumptions=frozenset({assumption_id}),
+                        )
+                    }
+                )
+            result = set()
+            for fact in propagated:
+                extended = fact.extended(external_hop)
+                if fact.evidence == Evidence.UNKNOWN:
+                    result.add(extended)
+                else:
+                    result.add(
+                        extended.with_evidence(
+                            Evidence.ASSUMED,
+                            frozenset({assumption_id}),
+                        )
+                    )
+            return frozenset(result)
 
         self.incomplete = True
+        note_key = (call.func, call.loc.line, call.loc.col)
         if note_key not in self._noted_unknown:
+            self._noted_unknown.add(note_key)
             self.notes.append(
                 f"{call.loc}: 外部调用 {call.func}() 缺少行为说明，返回值语义未知，"
-                f"按无法判定（潜在不可信）处理；分析不能据此给出安全结论"
+                f"只能按潜在不可信保守追踪；该路径不是已证实风险，分析不能据此给出安全结论"
             )
-            self._noted_unknown.add(note_key)
         key = ("unknown", call.func, call.loc.line, call.loc.col)
         hop = PathHop(
             call.loc,
             "unknown",
-            f"外部调用 {call.func}() 语义未知（缺少行为说明），返回值按潜在不可信处理",
+            f"外部调用 {call.func}() 语义未知（缺少行为说明），其净化、忽略或改写实参的行为均无法排除",
         )
-        unknown_fact = Fact(key, (hop,))
-        # 实参中无法判定的事实仍保留并继续传播，同时附上“返回值语义未知”。
-        return propagated | frozenset({unknown_fact})
+        facts = frozenset(
+            f.extended(hop).with_evidence(Evidence.UNKNOWN)
+            for f in propagated
+        )
+        unknown_fact = Fact(key, (hop,), evidence=Evidence.UNKNOWN)
+        return facts if propagated else frozenset({unknown_fact})
 
     # ---------- 诊断 ----------
 
     def _report_sink(self, call: Call, facts: frozenset[Fact]) -> None:
         if not facts:
             return
-        # 已确认的污点事实与无法判定的事实分开报告：
-        # 已确认 -> ERROR/TAINT-FLOW；无法判定 -> WARNING/TAINT-UNCERTAIN。
-        confirmed = frozenset(f for f in facts if f.key[0] not in UNCERTAIN_KEYS)
-        uncertain = frozenset(f for f in facts if f.key[0] in UNCERTAIN_KEYS)
+        confirmed = frozenset(f for f in facts if f.evidence == Evidence.CONFIRMED)
+        assumed = frozenset(f for f in facts if f.evidence == Evidence.ASSUMED)
+        unknown = frozenset(f for f in facts if f.evidence == Evidence.UNKNOWN)
         for group, severity, rule, suffix in (
             (confirmed, Severity.ERROR, "TAINT-FLOW", "不可信数据"),
-            (uncertain, Severity.WARNING, "TAINT-UNCERTAIN", "无法判定是否干净的数据"),
+            (assumed, Severity.WARNING, "TAINT-ASSUMED", "按外部行为说明视为不可信的数据"),
+            (unknown, Severity.WARNING, "TAINT-UNCERTAIN", "无法判定是否干净的数据"),
         ):
             if not group:
                 continue
             paths = tuple(
-                TaintPath(f.path + (PathHop(call.loc, "sink", f"{suffix}流入 {call.func}()"),))
+                TaintPath(
+                    f.path
+                    + (
+                        PathHop(
+                            call.loc,
+                            "sink",
+                            f"{suffix}流入 {call.func}()",
+                        ),
+                    )
+                )
                 for f in group
             )
-            dedup_key = (rule, call.func, call.loc.line, call.loc.col, tuple(p.hops for p in paths))
+            evidence = {
+                "TAINT-FLOW": Evidence.CONFIRMED,
+                "TAINT-ASSUMED": Evidence.ASSUMED,
+                "TAINT-UNCERTAIN": Evidence.UNKNOWN,
+            }[rule]
+            dedup_key = (
+                rule,
+                call.func,
+                call.loc.line,
+                call.loc.col,
+                tuple(p.hops for p in paths),
+            )
             if dedup_key in self._seen_diag:
                 continue
             self._seen_diag.add(dedup_key)
@@ -373,18 +536,27 @@ class Analyzer:
                     sink=call.func,
                     paths=paths,
                     rule=rule,
+                    evidence=evidence,
+                    assumptions=tuple(
+                        sorted({a for f in group for a in f.assumptions})
+                    ),
                 )
             )
-            if severity is Severity.WARNING:
+            if severity is Severity.WARNING and rule != "TAINT-ASSUMED":
                 self.incomplete = True
 
 
 def analyze_program(program: Program, config: AnalysisConfig | None = None):
     analyzer = Analyzer(program, config or AnalysisConfig())
-    verdict, diagnostics, notes = analyzer.run()
+    verdict, diagnostics, notes, assumptions = analyzer.run()
     from .model import AnalysisResult
 
-    return AnalysisResult(verdict=verdict, diagnostics=diagnostics, notes=notes)
+    return AnalysisResult(
+        verdict=verdict,
+        diagnostics=diagnostics,
+        notes=notes,
+        assumptions=assumptions,
+    )
 
 
 def analyze_source(source: str, config: AnalysisConfig | None = None) -> "AnalysisResult":

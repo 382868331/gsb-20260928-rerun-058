@@ -5,12 +5,21 @@
 
 from .model import (
     AnalysisResult,
+    AssumptionRecord,
     Diagnostic,
+    Evidence,
     Severity,
     TaintPath,
     Verdict,
 )
-from .analyzer import analyze_source, analyze_program, AnalysisConfig, ExternalSpec
+from .analyzer import (
+    analyze_source,
+    analyze_program,
+    AnalysisConfig,
+    compare_external_specs,
+    ExternalSpec,
+    SpecVersionChange,
+)
 from .parser import parse
 from .lexer import LexerError
 from .parser import ParseError
@@ -20,7 +29,11 @@ __all__ = [
     "analyze_program",
     "AnalysisConfig",
     "AnalysisResult",
+    "AssumptionRecord",
+    "Evidence",
     "ExternalSpec",
+    "SpecVersionChange",
+    "compare_external_specs",
     "Diagnostic",
     "Severity",
     "TaintPath",

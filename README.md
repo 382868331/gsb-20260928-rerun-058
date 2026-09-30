@@ -31,25 +31,28 @@ def 函数名(参数, ...) { 语句; ... }
   （默认 32）限制展开深度；触顶的调用按“潜在不可信”处理并产生
   `TAINT-UNCERTAIN` 警告，整体结论为 `INCOMPLETE` —— 未分析完绝不报 `SAFE`。
 - **未知外部调用**：程序中调用了既非内置、又未在程序内定义的函数时，
-  分析器**不臆测**其语义：
-  - 实参已带污点时，保守按“数据可能原样流出”追踪（已证实证据链，
-    `TAINT-FLOW`）；
-  - 无实参或实参本身无法判定时，返回值是语义未知的“潜在不可信值”，
-    携带 `unknown` 路径跳；它流入 sink 产生 `TAINT-UNCERTAIN` 警告，
-    程序中只要出现这种无说明调用，结论只能是 `INCOMPLETE`，
-    **绝不输出无依据的 `SAFE`，也不把未知调用直接报成已发生的漏洞**。
+  分析器不假设它会净化、忽略或原样返回实参。无论是否有参数，其返回值都
+  是语义未知的“潜在不可信值”，携带 `unknown` 路径跳；流入 sink 时只产生
+  `TAINT-UNCERTAIN`（无法判断），整体为 `INCOMPLETE`。这不是已证实漏洞；
+  未经过该返回值的常量 sink 仍保持无诊断，不会被株连报警。
 - **受限行为说明**：可通过 `AnalysisConfig(external_specs=...)` 为部分外部
-  调用提供说明 `ExternalSpec(name, description, returns)`，`returns` 取：
+  调用提供说明 `ExternalSpec(name, description, returns, version=...)`，
+  `returns` 取：
   `"clean"`（返回值干净）/ `"tainted"`（视为不可信来源）/
-  `"propagate"`（污点随实参传播，默认）。分析结果的 notes 会记录结论依赖了
-  哪些说明——说明变化，结论可能随之变化。
+  `"propagate"`（污点随实参传播，默认）。`AnalysisResult.assumptions` 给出
+  假设 ID、版本、使用位置和调用链；notes 中也会记录本次使用的说明。依赖
+  说明的 sink 诊断为 `TAINT-ASSUMED`，由说明推出的安全结论总判为 `ASSUMED`。
+  `compare_external_specs(old, new)` 可比较两版说明；某条说明被撤回时，只有
+  使用对应假设 ID 的诊断或结论失效，其他结论不受影响。
 
-已证实风险与无法判定的路径**分开诊断**：`TAINT-FLOW`（error）与
-`TAINT-UNCERTAIN`（warning）互不吞没；只要存在未完成判断，结论为
-`INCOMPLETE`（即使同时存在已证实风险路径，该路径仍完整呈现）。
+三类证据分开诊断：`TAINT-FLOW` / `CONFIRMED`（已证实）、
+`TAINT-ASSUMED` / `ASSUMED`（依赖外部说明）、`TAINT-UNCERTAIN` /
+`UNKNOWN`（无法判断）。证据链互不吞没；同时存在已证实和无法判断路径时，
+两条路径都会呈现，总判为 `INCOMPLETE`。
 
-结论取值：`UNSAFE`（污点到达 sink）/ `INCOMPLETE`（分析未完成）/
-`SAFE`（完整分析且无污点流）/ `PARSE_ERROR`。
+结论取值：`UNSAFE`（存在已证实风险）/ `ASSUMED`（结论依赖外部说明）/
+`INCOMPLETE`（存在无法判断项）/ `SAFE`（完整分析、无风险且不依赖外部说明）/
+`PARSE_ERROR`。
 
 ## 使用
 
