@@ -58,6 +58,30 @@ class AssumptionRecord:
     paths: tuple[TaintPath, ...] = ()
 
 
+@dataclass(frozen=True)
+class PathExplanation:
+    """一条到达结论位置的独立依据。"""
+
+    path: TaintPath
+    evidence: Evidence
+    assumptions: tuple[str, ...] = ()
+    kind: str = "risk"  # risk | safe | unknown
+
+
+@dataclass(frozen=True)
+class ConclusionExplanation:
+    """同一风险位置上已证实、条件、未知与安全依据的最小解释。"""
+
+    conclusion_id: str
+    sink: str
+    loc: Loc
+    state: str
+    path_explanations: tuple[PathExplanation, ...] = ()
+    assumption_groups: tuple[tuple[str, ...], ...] = ()
+    indispensable_assumptions: tuple[str, ...] = ()
+    common_assumptions: tuple[str, ...] = ()
+
+
 class Verdict(str, Enum):
     UNSAFE = "UNSAFE"        # 发现污点到达 sink
     ASSUMED = "ASSUMED"      # 风险或安全结论依赖外部行为假设
@@ -72,6 +96,7 @@ class AnalysisResult:
     diagnostics: list[Diagnostic]
     notes: list[str]
     assumptions: tuple[AssumptionRecord, ...] = ()
+    explanations: tuple[ConclusionExplanation, ...] = ()
 
     def format_text(self) -> str:
         lines = [f"分析结论: {self.verdict.value}"]
@@ -98,4 +123,22 @@ class AnalysisResult:
                     lines.append(f"    {hop.loc}  [{hop.kind}] {hop.text}")
         for note in self.notes:
             lines.append(f"NOTE: {note}")
+        for explanation in self.explanations:
+            lines.append(
+                f"CONCLUSION {explanation.conclusion_id}: {explanation.state} "
+                f"at {explanation.loc} ({explanation.sink})"
+            )
+            if explanation.assumption_groups:
+                lines.append(
+                    "    最小替代假设组: "
+                    + " 或 ".join(
+                        "(" + ", ".join(group) + ")"
+                        for group in explanation.assumption_groups
+                    )
+                )
+            if explanation.indispensable_assumptions:
+                lines.append(
+                    "    共同且不可或缺的假设: "
+                    + ", ".join(explanation.indispensable_assumptions)
+                )
         return "\n".join(lines)

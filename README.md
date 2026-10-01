@@ -44,6 +44,19 @@ def 函数名(参数, ...) { 语句; ... }
   说明的 sink 诊断为 `TAINT-ASSUMED`，由说明推出的安全结论总判为 `ASSUMED`。
   `compare_external_specs(old, new)` 可比较两版说明；某条说明被撤回时，只有
   使用对应假设 ID 的诊断或结论失效，其他结论不受影响。
+- **按结论解释最小必要假设**：`AnalysisResult.explanations` 为每个 sink 位置
+  （稳定 ID：`函数名:行:列`）汇总替代路径。风险路径的假设以“最小替代假设组”
+  表示：`(A) 或 (B)` 中 A、B 都不是不可或缺；只有所有替代路径共同需要、且
+  删除后该路径无法成立的假设才进入 `indispensable_assumptions`。安全常量、
+  语言内净化路径以 `kind="safe"` 独立保存；与未知/风险分支合流时不会相互吞没。
+- **临时关闭假设**：`AnalysisConfig(disabled_assumptions={"lib@v1"})` 可临时
+  撤回一项或一组说明；关闭后相关路径回到未知外部调用语义，可比较已证实风险、
+  条件风险、无法判断和独立安全路径的变化。
+- **研究快照与增量修订**：`snapshot_analysis(source, config)` 保存源码、说明、
+  说明版本、结论位置和解释；`ResearchSnapshot.save()/load()` 可持久化为 JSON。
+  `revise_specs(snapshot, new_specs, disabled_assumptions=...)` 重算后按稳定
+  sink 位置输出 `affected_conclusions` 与 `reused_conclusions`，未受说明变更
+  影响的解释沿用旧对象，风险位置和采用的假设版本仍可对应回之前研究。
 
 三类证据分开诊断：`TAINT-FLOW` / `CONFIRMED`（已证实）、
 `TAINT-ASSUMED` / `ASSUMED`（依赖外部说明）、`TAINT-UNCERTAIN` /

@@ -1,4 +1,6 @@
 import unittest
+from tempfile import TemporaryDirectory
+from pathlib import Path
 
 from taintlab import (
     AnalysisConfig,
@@ -11,6 +13,8 @@ from taintlab import (
     analyze_source,
     compare_external_specs,
     parse,
+    revise_specs,
+    snapshot_analysis,
 )
 from taintlab.callgraph import build_call_graph
 
@@ -368,6 +372,126 @@ class TaintAnalysisTests(unittest.TestCase):
         invalid = {aid for change in changes for aid in change.invalidated_assumptions}
         affected = [d for d in result.diagnostics if set(d.assumptions) & invalid]
         self.assertEqual([d.assumptions[0] for d in affected], ["fetch_b@9"])
+
+    def test_safe_constant_path_has_independent_conclusion(self):
+        result = analyze_source('def main(){ exec("ls"); }')
+        explanation = result.explanations[0]
+        self.assertEqual(explanation.state, "CONFIRMED_SAFE")
+        self.assertEqual(explanation.path_explanations[0].kind, "safe")
+        self.assertEqual(explanation.assumption_groups, ())
+
+    def test_disabling_assumption_moves_conditional_risk_to_unknown(self):
+        cfg = AnalysisConfig(
+            external_specs={
+                "fetch": ExternalSpec("fetch", "网络输入", returns="tainted", version="1")
+            }
+        )
+        enabled = analyze_source("def main(){ exec(fetch()); }", cfg)
+        self.assertEqual(enabled.explanations[0].state, "CONDITIONAL_RISK")
+        disabled = analyze_source(
+            "def main(){ exec(fetch()); }",
+            AnalysisConfig(
+                external_specs=cfg.external_specs,
+                disabled_assumptions={"fetch@1"},
+            ),
+        )
+        self.assertIs(disabled.verdict, Verdict.INCOMPLETE)
+        self.assertEqual(disabled.explanations[0].state, "UNKNOWN_RISK")
+
+    def test_minimal_assumptions_distinguish_common_from_alternative_paths(self):
+        source = (
+            "def main(){"
+            " x = read_input();"
+            " if (1) { v = encode(x); } else { v = relay(x); }"
+            " exec(v);"
+            "}"
+        )
+        cfg = AnalysisConfig(
+            external_specs={
+                "encode": ExternalSpec("encode", "编码但保留污点", version="1"),
+                "relay": ExternalSpec("relay", "转发", version="2"),
+            }
+        )
+        explanation = analyze_source(source, cfg).explanations[0]
+        self.assertEqual(
+            explanation.assumption_groups,
+            (("encode@1",), ("relay@2",)),
+        )
+        self.assertEqual(explanation.common_assumptions, ())
+        self.assertEqual(explanation.indispensable_assumptions, ())
+
+    def test_shared_assumption_is_indispensable_across_alternatives(self):
+        source = (
+            "def main(){"
+            " x = read_input();"
+            " if (1) { v = safe_lib(x); } else { v = safe_lib(x); }"
+            " exec(v);"
+            "}"
+        )
+        cfg = AnalysisConfig(
+            external_specs={
+                "safe_lib": ExternalSpec("safe_lib", "库保持污点语义", version="9"),
+                "encode": ExternalSpec("encode", "编码", version="1"),
+                "relay": ExternalSpec("relay", "转发", version="2"),
+            }
+        )
+        explanation = analyze_source(source, cfg).explanations[0]
+        self.assertEqual(explanation.assumption_groups, (("safe_lib@9",),))
+        self.assertEqual(explanation.common_assumptions, ("safe_lib@9",))
+        self.assertEqual(
+            explanation.indispensable_assumptions, ("safe_lib@9",)
+        )
+
+    def test_safe_branch_remains_independent_when_other_branch_is_unknown(self):
+        source = (
+            "def main(){"
+            " if (1) { v = \"safe\"; } else { v = mystery(); }"
+            " exec(v);"
+            "}"
+        )
+        explanation = analyze_source(source).explanations[0]
+        self.assertEqual(explanation.state, "UNKNOWN_RISK")
+        kinds = {item.kind for item in explanation.path_explanations}
+        self.assertEqual(kinds, {"risk", "safe"})
+
+    def test_snapshot_revision_reuses_unrelated_conclusion(self):
+        source = (
+            "def main(){"
+            " exec(fetch_a());"
+            ' exec("ls");'
+            "}"
+        )
+        cfg = AnalysisConfig(
+            external_specs={
+                "fetch_a": ExternalSpec("fetch_a", "A", returns="tainted", version="1")
+            }
+        )
+        _, snapshot = snapshot_analysis(source, cfg)
+        new_result, report, new_snapshot = revise_specs(
+            snapshot,
+            {
+                "fetch_a": ExternalSpec(
+                    "fetch_a", "A changed", returns="clean", version="2"
+                )
+            },
+        )
+        self.assertIn("exec:1:13", report.affected_conclusions)
+        self.assertIn("exec:1:30", report.reused_conclusions)
+        self.assertEqual(
+            {item.conclusion_id for item in new_snapshot.explanations},
+            {item.conclusion_id for item in snapshot.explanations},
+        )
+        self.assertIs(new_result.verdict, Verdict.ASSUMED)
+
+        with TemporaryDirectory() as directory:
+            snapshot_path = Path(directory) / "research.json"
+            snapshot.save(snapshot_path)
+            loaded = type(snapshot).load(snapshot_path)
+            self.assertEqual(loaded.source, snapshot.source)
+            self.assertEqual(
+                tuple(item.conclusion_id for item in loaded.explanations),
+                tuple(item.conclusion_id for item in snapshot.explanations),
+            )
 
 
 if __name__ == "__main__":
