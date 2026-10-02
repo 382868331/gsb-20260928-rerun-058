@@ -50,6 +50,12 @@ def 函数名(参数, ...) { 语句; ... }
 `UNKNOWN`（无法判断）。证据链互不吞没；同时存在已证实和无法判断路径时，
 两条路径都会呈现，总判为 `INCOMPLETE`。
 
+每个 sink 位置还会生成结论解释：已证实风险、条件风险和无法判断分开标记；
+minimal_assumption_sets 给出每条替代风险路径的最小假设组合，只有所有替代路径
+共同需要的假设才列入 indispensable_assumptions。分支共享调用进入 common_basis，
+汇合后分叉的部分进入 alternative_basis；常量或 sanitizer 安全路径保留在
+safe_bases，独立于未知外部返回值。
+
 结论取值：`UNSAFE`（存在已证实风险）/ `ASSUMED`（结论依赖外部说明）/
 `INCOMPLETE`（存在无法判断项）/ `SAFE`（完整分析、无风险且不依赖外部说明）/
 `PARSE_ERROR`。
@@ -64,6 +70,15 @@ python -m taintlab examples/recursion.tl    # INCOMPLETE
 python -m taintlab examples/external_call.tl  # 未知外部调用：INCOMPLETE
 python -m unittest discover -s tests        # 自带正反例测试
 ```
+
+命令行可用 `--disable-assumption ID` 或 `--disable-assumption 组名` 临时关闭假设；该参数可重复传入。
+
+结论研究接口：
+
+- AnalysisConfig(disabled_assumptions=...) 临时关闭一个或一组外部行为假设；
+- AnalysisResult.explanations 查看风险状态、安全路径、共同依据、替代依据和最小必要假设；
+- save_study(path, source, specs, result, revision) 保存研究；
+- load_study(path) 与 revise_study(study, revised_specs) 只重算受版本变化影响的结论。
 
 ## 代码结构
 

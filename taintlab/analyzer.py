@@ -18,7 +18,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+import json
+from pathlib import Path
 
 from .ast_nodes import (
     AssignStmt,
@@ -41,7 +43,12 @@ from .model import (
     Diagnostic,
     Evidence,
     PathHop,
+    ConclusionExplanation,
+    PathBasis,
+    SavedStudy,
     Severity,
+    StudyRevisionResult,
+    ConclusionRevision,
     TaintPath,
     Verdict,
 )
@@ -76,6 +83,7 @@ class ExternalSpec:
     description: str
     returns: str = "propagate"
     version: str | None = None
+    groups: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.returns not in ("clean", "tainted", "propagate"):
@@ -90,6 +98,7 @@ class Fact:
     path: tuple[PathHop, ...]
     evidence: Evidence = Evidence.CONFIRMED
     assumptions: frozenset[str] = frozenset()
+    safe: bool = False
 
     def extended(self, hop: PathHop) -> "Fact":
         return replace(self, path=self.path + (hop,))
@@ -147,7 +156,7 @@ def compare_external_specs(
             continue
         changed_fields = tuple(
             field
-            for field in ("version", "returns", "description")
+            for field in ("version", "returns", "description", "groups")
             if getattr(old, field) != getattr(new, field)
         )
         if changed_fields:
@@ -175,10 +184,15 @@ Env = dict[str, frozenset[Fact]]
 class AnalysisConfig:
     max_call_depth: int = 32
     external_specs: dict[str, ExternalSpec] | None = None
+    disabled_assumptions: frozenset[str] | tuple[str, ...] | list[str] | set[str] | None = None
 
     def __post_init__(self) -> None:
         if self.external_specs is None:
             self.external_specs = {}
+        if self.disabled_assumptions is None:
+            self.disabled_assumptions = frozenset()
+        else:
+            self.disabled_assumptions = frozenset(self.disabled_assumptions)
 
 
 class Analyzer:
@@ -193,6 +207,7 @@ class Analyzer:
         self._noted_unknown: set[tuple] = set()
         self._spec_deps: set[str] = set()
         self._spec_uses: dict[str, dict] = {}
+        self.explanations: list[ConclusionExplanation] = []
 
     # ---------- 对外入口 ----------
 
@@ -320,15 +335,41 @@ class Analyzer:
             merged[name] = facts
         return merged
 
+    @staticmethod
+    def _safe_fact(expr, hop_kind: str, text: str, evidence=Evidence.CONFIRMED, assumptions=frozenset()):
+        hop = PathHop(expr.loc, hop_kind, text)
+        key = ("safe", hop_kind, expr.loc.line, expr.loc.col)
+        return Fact(
+            key,
+            (hop,),
+            evidence=evidence,
+            assumptions=assumptions,
+            safe=True,
+        )
+
     # ---------- 表达式 ----------
 
     def _eval(self, expr, env: Env, depth: int, stack: frozenset[str]) -> frozenset[Fact]:
-        if isinstance(expr, (NumberLit, StringLit, BoolLit)):
-            return frozenset()
+        if isinstance(expr, NumberLit):
+            return frozenset({
+                self._safe_fact(expr, "constant", f"数字常量 {expr.value}")
+            })
+        if isinstance(expr, StringLit):
+            return frozenset({
+                self._safe_fact(expr, "constant", f'字符串常量 "{expr.value}"')
+            })
+        if isinstance(expr, BoolLit):
+            return frozenset({
+                self._safe_fact(expr, "constant", f"布尔常量 {expr.value}")
+            })
         if isinstance(expr, Var):
             return env.get(expr.name, frozenset())
         if isinstance(expr, Unary):
-            return self._eval(expr.operand, env, depth, stack)
+            facts = self._eval(expr.operand, env, depth, stack)
+            if facts:
+                hop = PathHop(expr.loc, "expr", f"经一元运算符 {expr.op} 传播")
+                facts = frozenset(f.extended(hop) for f in facts)
+            return facts
         if isinstance(expr, Binary):
             left = self._eval(expr.left, env, depth, stack)
             right = self._eval(expr.right, env, depth, stack)
@@ -355,7 +396,13 @@ class Analyzer:
         if call.func in SANITIZERS:
             # 明确净化：返回值不带任何原污点，净化后的值不能和原值混成一份。
             self.notes.append(f"{call.loc}: 调用 {call.func}() 对 {len(arg_facts)} 个值进行了净化")
-            return frozenset()
+            return frozenset({
+                self._safe_fact(
+                    call,
+                    "sanitizer",
+                    f"净化函数 {call.func}() 返回值与原污点分离，按干净数据处理",
+                )
+            })
 
         if call.func in SINKS:
             tainted = frozenset().union(*arg_facts) if arg_facts else frozenset()
@@ -413,6 +460,22 @@ class Analyzer:
 
         propagated = frozenset().union(*arg_facts) if arg_facts else frozenset()
         spec = self.config.external_specs.get(call.func)
+        assumption_id = (
+            spec_assumption_id(spec.name, spec.version)
+            if spec is not None
+            else None
+        )
+        if (
+            spec is not None
+            and (
+                assumption_id in self.config.disabled_assumptions
+                or set(spec.groups) & set(self.config.disabled_assumptions)
+            )
+        ):
+            self.notes.append(
+                f"{call.loc}: 外部调用 {call.func}() 的假设 {assumption_id} 已被临时关闭，按缺少行为说明处理"
+            )
+            spec = None
         if spec is not None:
             external_hop = PathHop(
                 call.loc,
@@ -432,7 +495,21 @@ class Analyzer:
                 f"({assumption_id}, returns={spec.returns}) 判定：{spec.description}"
             )
             if spec.returns == "clean":
-                return frozenset()
+                return frozenset({
+                    Fact(
+                        ("spec_clean", call.func, call.loc.line, call.loc.col),
+                        (
+                            PathHop(
+                                call.loc,
+                                "external",
+                                f"外部调用 {call.func}() 按说明返回干净值：{spec.description}",
+                            ),
+                        ),
+                        evidence=Evidence.ASSUMED,
+                        assumptions=frozenset({assumption_id}),
+                        safe=True,
+                    )
+                })
             if spec.returns == "tainted":
                 origin = ("spec_source", call.func, call.loc.line, call.loc.col)
                 hop = PathHop(
@@ -453,7 +530,14 @@ class Analyzer:
             result = set()
             for fact in propagated:
                 extended = fact.extended(external_hop)
-                if fact.evidence == Evidence.UNKNOWN:
+                if fact.safe or fact.evidence == Evidence.CONFIRMED:
+                    result.add(
+                        extended.with_evidence(
+                            Evidence.ASSUMED,
+                            frozenset({assumption_id}),
+                        )
+                    )
+                elif fact.evidence == Evidence.UNKNOWN:
                     result.add(extended)
                 else:
                     result.add(
@@ -478,21 +562,36 @@ class Analyzer:
             "unknown",
             f"外部调用 {call.func}() 语义未知（缺少行为说明），其净化、忽略或改写实参的行为均无法排除",
         )
+        risk_propagated = frozenset(f for f in propagated if not f.safe)
         facts = frozenset(
             f.extended(hop).with_evidence(Evidence.UNKNOWN)
-            for f in propagated
+            for f in risk_propagated
         )
         unknown_fact = Fact(key, (hop,), evidence=Evidence.UNKNOWN)
-        return facts if propagated else frozenset({unknown_fact})
+        return facts if risk_propagated else frozenset({unknown_fact})
 
     # ---------- 诊断 ----------
 
     def _report_sink(self, call: Call, facts: frozenset[Fact]) -> None:
-        if not facts:
-            return
-        confirmed = frozenset(f for f in facts if f.evidence == Evidence.CONFIRMED)
-        assumed = frozenset(f for f in facts if f.evidence == Evidence.ASSUMED)
-        unknown = frozenset(f for f in facts if f.evidence == Evidence.UNKNOWN)
+        risk_facts = frozenset(f for f in facts if not f.safe)
+        safe_facts = frozenset(f for f in facts if f.safe)
+        if not risk_facts and not safe_facts:
+            safe_facts = frozenset({
+                Fact(
+                    ("clean", call.func, call.loc.line, call.loc.col),
+                    (
+                        PathHop(
+                            call.loc,
+                            "clean",
+                            f"{call.func}() 的实参未携带任何风险依据",
+                        ),
+                    ),
+                    safe=True,
+                )
+            })
+        confirmed = frozenset(f for f in risk_facts if f.evidence == Evidence.CONFIRMED)
+        assumed = frozenset(f for f in risk_facts if f.evidence == Evidence.ASSUMED)
+        unknown = frozenset(f for f in risk_facts if f.evidence == Evidence.UNKNOWN)
         for group, severity, rule, suffix in (
             (confirmed, Severity.ERROR, "TAINT-FLOW", "不可信数据"),
             (assumed, Severity.WARNING, "TAINT-ASSUMED", "按外部行为说明视为不可信的数据"),
@@ -500,19 +599,8 @@ class Analyzer:
         ):
             if not group:
                 continue
-            paths = tuple(
-                TaintPath(
-                    f.path
-                    + (
-                        PathHop(
-                            call.loc,
-                            "sink",
-                            f"{suffix}流入 {call.func}()",
-                        ),
-                    )
-                )
-                for f in group
-            )
+            sink_hop = PathHop(call.loc, "sink", f"{suffix}流入 {call.func}()")
+            paths = tuple(TaintPath(f.path + (sink_hop,)) for f in group)
             evidence = {
                 "TAINT-FLOW": Evidence.CONFIRMED,
                 "TAINT-ASSUMED": Evidence.ASSUMED,
@@ -544,7 +632,128 @@ class Analyzer:
             )
             if severity is Severity.WARNING and rule != "TAINT-ASSUMED":
                 self.incomplete = True
+        self._explain_sink(call, confirmed, assumed, unknown, safe_facts)
 
+    def _explain_sink(
+        self,
+        call: Call,
+        confirmed: frozenset[Fact],
+        assumed: frozenset[Fact],
+        unknown: frozenset[Fact],
+        safe_facts: frozenset[Fact],
+    ) -> None:
+        sink_hop = PathHop(call.loc, "sink", f"结论位置 {call.func}()")
+        groups = (
+            (confirmed, Evidence.CONFIRMED),
+            (assumed, Evidence.ASSUMED),
+            (unknown, Evidence.UNKNOWN),
+        )
+        risk_bases = tuple(
+            PathBasis(
+                path=TaintPath(f.path + (sink_hop,)),
+                evidence=evidence,
+                safe=False,
+                assumptions=tuple(sorted(f.assumptions)),
+            )
+            for group, evidence in groups
+            for f in sorted(group, key=lambda item: tuple((h.loc.line, h.loc.col, h.kind, h.text) for h in item.path))
+        )
+        safe_bases = tuple(
+            PathBasis(
+                path=TaintPath(f.path + (sink_hop,)),
+                evidence=f.evidence,
+                safe=True,
+                assumptions=tuple(sorted(f.assumptions)),
+            )
+            for f in sorted(safe_facts, key=lambda item: tuple((h.loc.line, h.loc.col, h.kind, h.text) for h in item.path))
+        )
+        raw_assumption_sets = {
+            basis.assumptions
+            for basis in risk_bases
+            if basis.assumptions
+        }
+        raw_assumption_values = [set(item) for item in raw_assumption_sets]
+        assumption_sets = tuple(
+            sorted(
+                assumption_set
+                for assumption_set in raw_assumption_sets
+                if not any(
+                    other < set(assumption_set)
+                    for other in raw_assumption_values
+                )
+            )
+        )
+        requirement_sets = [set(basis.assumptions) for basis in risk_bases]
+        assumption_versions = {
+            assumption: assumption
+            for basis in risk_bases
+            for assumption in basis.assumptions
+        }
+        indispensable = (
+            tuple(sorted(set.intersection(*requirement_sets)))
+            if requirement_sets
+            else ()
+        )
+        risk_hop_sets = [
+            {
+                (hop.loc.line, hop.loc.col, hop.kind, hop.text)
+                for hop in basis.path.hops[:-1]
+            }
+            for basis in risk_bases
+        ]
+        common_keys = set.intersection(*risk_hop_sets) if risk_hop_sets else set()
+        common_hops = (
+            tuple(
+                hop
+                for hop in risk_bases[0].path.hops[:-1]
+                if (hop.loc.line, hop.loc.col, hop.kind, hop.text) in common_keys
+            )
+            if risk_bases
+            else ()
+        )
+        alternative_hops = tuple(
+            dict.fromkeys(
+                hop
+                for basis in risk_bases
+                for hop in basis.path.hops[:-1]
+                if (hop.loc.line, hop.loc.col, hop.kind, hop.text) not in common_keys
+            )
+        )
+        risk_bases = tuple(
+            replace(
+                basis,
+                common=not any(
+                    (hop.loc.line, hop.loc.col, hop.kind, hop.text) not in common_keys
+                    for hop in basis.path.hops[:-1]
+                ),
+            )
+            for basis in risk_bases
+        )
+        if confirmed:
+            status = "CONFIRMED_RISK"
+        elif assumed:
+            status = "CONDITIONAL_RISK"
+        elif unknown:
+            status = "UNKNOWN"
+        elif any(b.evidence == Evidence.ASSUMED for b in safe_bases):
+            status = "ASSUMED_SAFE"
+        else:
+            status = "SAFE"
+        self.explanations.append(
+            ConclusionExplanation(
+                sink=call.func,
+                loc=call.loc,
+                status=status,
+                risk_bases=risk_bases,
+                safe_bases=safe_bases,
+                minimal_assumption_sets=assumption_sets,
+                indispensable_assumptions=indispensable,
+                common_basis=common_hops,
+                alternative_basis=alternative_hops,
+                disabled_assumptions=tuple(sorted(self.config.disabled_assumptions)),
+                assumption_versions=assumption_versions,
+            )
+        )
 
 def analyze_program(program: Program, config: AnalysisConfig | None = None):
     analyzer = Analyzer(program, config or AnalysisConfig())
@@ -556,6 +765,7 @@ def analyze_program(program: Program, config: AnalysisConfig | None = None):
         diagnostics=diagnostics,
         notes=notes,
         assumptions=assumptions,
+        explanations=analyzer.explanations,
     )
 
 
@@ -574,3 +784,222 @@ def analyze_source(source: str, config: AnalysisConfig | None = None) -> "Analys
             notes=[],
         )
     return analyze_program(program, config)
+
+
+def save_study(path, source, specs, result, revision="baseline"):
+    payload = {
+        "source": source,
+        "revision": revision,
+        "external_specs": {
+            name: {
+                "name": spec.name,
+                "description": spec.description,
+                "returns": spec.returns,
+                "version": spec.version,
+                "groups": list(spec.groups),
+            }
+            for name, spec in specs.items()
+        },
+        "result": asdict(result),
+    }
+    Path(path).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
+        encoding="utf-8",
+    )
+
+
+def load_study(path):
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    specs = {
+        name: ExternalSpec(
+            name=item["name"],
+            description=item["description"],
+            returns=item["returns"],
+            version=item.get("version"),
+            groups=tuple(item.get("groups", ())),
+        )
+        for name, item in payload["external_specs"].items()
+    }
+    return SavedStudy(
+        source=payload["source"],
+        result=_result_from_dict(payload["result"]),
+        external_specs=specs,
+        revision=payload.get("revision", "baseline"),
+    )
+
+
+def revise_study(study, new_specs, disabled_assumptions=(), max_call_depth=32):
+    invalid = tuple(
+        aid
+        for change in compare_external_specs(study.external_specs, new_specs)
+        for aid in change.invalidated_assumptions
+    )
+    cfg = AnalysisConfig(
+        max_call_depth=max_call_depth,
+        external_specs=new_specs,
+        disabled_assumptions=disabled_assumptions,
+    )
+    fresh = analyze_source(study.source, cfg)
+    old_by_id = {(e.sink, e.loc.line, e.loc.col): e for e in study.result.explanations}
+    new_by_id = {(e.sink, e.loc.line, e.loc.col): e for e in fresh.explanations}
+    version_changes = compare_external_specs(study.external_specs, new_specs)
+    changed_names = {
+        change.name
+        for change in version_changes
+        if change.status != "unchanged"
+    }
+    affected = {
+        key
+        for mapping in (old_by_id, new_by_id)
+        for key, explanation in mapping.items()
+        if (
+            set(_explanation_assumptions(explanation)) & set(invalid)
+            or _explanation_uses_changed_external(explanation, changed_names)
+        )
+    }
+    revisions = []
+    explanations = []
+    for key in sorted(set(old_by_id) | set(new_by_id)):
+        old = old_by_id.get(key)
+        new = new_by_id.get(key)
+        if key in affected:
+            if new is not None:
+                explanations.append(new)
+            elif old is not None:
+                explanations.append(old)
+            current = new or old
+            old_assumptions = _explanation_assumptions(old) if old else ()
+            new_assumptions = _explanation_assumptions(new) if new else ()
+            revisions.append(
+                ConclusionRevision(
+                    conclusion_id=current.conclusion_id,
+                    loc=current.loc,
+                    old_status=old.status if old else None,
+                    new_status=new.status if new else None,
+                    old_assumptions=old_assumptions,
+                    new_assumptions=new_assumptions,
+                    reused=False,
+                    invalidated_assumptions=tuple(
+                        sorted(set(invalid) & set(old_assumptions + new_assumptions))
+                    ),
+                )
+            )
+        elif old is not None:
+            explanations.append(old)
+    result = _merge_result(study.result, fresh, tuple(explanations), affected)
+    return StudyRevisionResult(
+        result=result,
+        changes=tuple(revisions),
+        invalidated_assumptions=invalid,
+    )
+
+
+def _explanation_assumptions(explanation):
+    return tuple(
+        sorted(
+            {
+                *explanation.indispensable_assumptions,
+                *(aid for group in explanation.minimal_assumption_sets for aid in group),
+                *(aid for basis in explanation.risk_bases for aid in basis.assumptions),
+                *(aid for basis in explanation.safe_bases for aid in basis.assumptions),
+            }
+        )
+    )
+
+
+def _explanation_uses_changed_external(explanation, names):
+    if not names:
+        return False
+    external_texts = [
+        hop.text
+        for basis in (*explanation.risk_bases, *explanation.safe_bases)
+        for hop in basis.path.hops
+        if hop.kind == "external" or hop.kind == "unknown"
+    ]
+    return any(
+        any(text.startswith("外部调用 " + name + "()") for text in external_texts)
+        for name in names
+    )
+
+
+def _merge_result(old, fresh, explanations, affected):
+    return replace(fresh, explanations=tuple(explanations))
+
+
+def _json_default(value):
+    if hasattr(value, "value"):
+        return value.value
+    return str(value)
+
+
+def _result_from_dict(data):
+    from .model import AnalysisResult
+
+    def make_loc(item):
+        return Loc(item["line"], item["col"], item["offset"])
+
+    def make_hop(item):
+        return PathHop(make_loc(item["loc"]), item["kind"], item["text"])
+
+    def make_path(item):
+        return TaintPath(tuple(make_hop(h) for h in item["hops"]))
+
+    def make_basis(item):
+        return PathBasis(
+            path=make_path(item["path"]),
+            evidence=Evidence(item["evidence"]),
+            safe=item["safe"],
+            assumptions=tuple(item["assumptions"]),
+            common=item["common"],
+        )
+
+    diagnostics = tuple(
+        Diagnostic(
+            severity=Severity(item["severity"]),
+            message=item["message"],
+            loc=make_loc(item["loc"]),
+            sink=item["sink"],
+            paths=tuple(make_path(p) for p in item["paths"]),
+            rule=item["rule"],
+            evidence=Evidence(item["evidence"]),
+            assumptions=tuple(item["assumptions"]),
+        )
+        for item in data["diagnostics"]
+    )
+    assumptions = tuple(
+        AssumptionRecord(
+            assumption_id=item["assumption_id"],
+            name=item["name"],
+            version=item["version"],
+            returns=item["returns"],
+            description=item["description"],
+            locations=tuple(make_loc(x) for x in item["locations"]),
+            paths=tuple(make_path(p) for p in item["paths"]),
+        )
+        for item in data["assumptions"]
+    )
+    explanations = tuple(
+        ConclusionExplanation(
+            sink=item["sink"],
+            loc=make_loc(item["loc"]),
+            status=item["status"],
+            risk_bases=tuple(make_basis(x) for x in item["risk_bases"]),
+            safe_bases=tuple(make_basis(x) for x in item["safe_bases"]),
+            minimal_assumption_sets=tuple(
+                tuple(x) for x in item["minimal_assumption_sets"]
+            ),
+            indispensable_assumptions=tuple(item["indispensable_assumptions"]),
+            common_basis=tuple(make_hop(x) for x in item["common_basis"]),
+            alternative_basis=tuple(make_hop(x) for x in item["alternative_basis"]),
+            disabled_assumptions=tuple(item["disabled_assumptions"]),
+            assumption_versions=item.get("assumption_versions", {}),
+        )
+        for item in data.get("explanations", ())
+    )
+    return AnalysisResult(
+        verdict=Verdict(data["verdict"]),
+        diagnostics=diagnostics,
+        notes=list(data.get("notes", [])),
+        assumptions=assumptions,
+        explanations=explanations,
+    )

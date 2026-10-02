@@ -13,6 +13,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-depth", type=int, default=32, help="跨函数分析的最大调用深度（默认 32）"
     )
+    parser.add_argument(
+        "--disable-assumption",
+        action="append",
+        default=[],
+        help="临时关闭的外部假设 ID 或假设组；可重复传入",
+    )
     args = parser.parse_args(argv)
 
     if args.file == "-":
@@ -21,7 +27,13 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.file, "r", encoding="utf-8") as fh:
             source = fh.read()
 
-    result = analyze_source(source, AnalysisConfig(max_call_depth=args.max_depth))
+    result = analyze_source(
+        source,
+        AnalysisConfig(
+            max_call_depth=args.max_depth,
+            disabled_assumptions=args.disable_assumption,
+        ),
+    )
     print(result.format_text())
     if result.verdict.value == "PARSE_ERROR":
         return 2

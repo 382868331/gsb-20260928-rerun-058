@@ -10,6 +10,9 @@ from taintlab import (
     Verdict,
     analyze_source,
     compare_external_specs,
+    load_study,
+    revise_study,
+    save_study,
     parse,
 )
 from taintlab.callgraph import build_call_graph
@@ -368,6 +371,113 @@ class TaintAnalysisTests(unittest.TestCase):
         invalid = {aid for change in changes for aid in change.invalidated_assumptions}
         affected = [d for d in result.diagnostics if set(d.assumptions) & invalid]
         self.assertEqual([d.assumptions[0] for d in affected], ["fetch_b@9"])
+
+    def test_conclusion_lists_minimal_but_not_indispensable_alternatives(self):
+        source = (
+            "def main(){"
+            " if (1) { v = fetch_a(); } else { v = fetch_b(); }"
+            " exec(v);"
+            "}"
+        )
+        cfg = AnalysisConfig(
+            external_specs={
+                "fetch_a": ExternalSpec("fetch_a", "A", returns="tainted", version="1"),
+                "fetch_b": ExternalSpec("fetch_b", "B", returns="tainted", version="2"),
+            }
+        )
+        result = analyze_source(source, cfg)
+        explanations = [e for e in result.explanations if e.status == "CONDITIONAL_RISK"]
+        self.assertEqual(len(explanations), 1)
+        explanation = explanations[0]
+        self.assertEqual({e.status for e in explanations}, {"CONDITIONAL_RISK"})
+        self.assertEqual(
+            set(explanation.minimal_assumption_sets),
+            {("fetch_a@1",), ("fetch_b@2",)},
+        )
+        self.assertFalse(explanation.indispensable_assumptions)
+        self.assertIn("join", [hop.kind for hop in explanation.common_basis])
+        self.assertIn("external", [hop.kind for hop in explanation.alternative_basis])
+        self.assertNotIn("join", [hop.kind for hop in explanation.alternative_basis])
+
+    def test_shared_assumption_across_alternatives_is_indispensable(self):
+        source = (
+            "def main(){"
+            " v = read();"
+            " if (1) { w = v; } else { w = v + 1; }"
+            " exec(w);"
+            "}"
+        )
+        cfg = AnalysisConfig(
+            external_specs={
+                "read": ExternalSpec("read", "读取配置", returns="tainted", version="3")
+            }
+        )
+        result = analyze_source(source, cfg)
+        explanation = next(e for e in result.explanations if e.status == "CONDITIONAL_RISK")
+        self.assertEqual(explanation.indispensable_assumptions, ("read@3",))
+        self.assertTrue(explanation.common_basis)
+        self.assertTrue(explanation.alternative_basis)
+
+    def test_disable_one_assumption_recomputes_conditional_to_unknown(self):
+        source = "def main(){ exec(fetch_url()); }"
+        spec = ExternalSpec("fetch_url", "读取网络", returns="tainted", version="2")
+        cfg = AnalysisConfig(
+            external_specs={"fetch_url": spec},
+            disabled_assumptions={"fetch_url@2"},
+        )
+        result = analyze_source(source, cfg)
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+        self.assertEqual(result.explanations[0].status, "UNKNOWN")
+        self.assertEqual(result.explanations[0].disabled_assumptions, ("fetch_url@2",))
+
+    def test_disable_assumption_group(self):
+        source = "def main(){ exec(fetch_url()); }"
+        cfg = AnalysisConfig(
+            external_specs={
+                "fetch_url": ExternalSpec(
+                    "fetch_url",
+                    "读取网络",
+                    returns="tainted",
+                    version="2",
+                    groups=("network",),
+                )
+            },
+            disabled_assumptions={"network"},
+        )
+        result = analyze_source(source, cfg)
+        self.assertEqual(result.explanations[0].status, "UNKNOWN")
+
+    def test_safe_constant_path_remains_independent_from_unknown_external(self):
+        source = 'def main(){ token = get_token(); exec("ls"); exec(token); }'
+        result = analyze_source(source)
+        constant, unknown = sorted(result.explanations, key=lambda e: e.status)
+        self.assertEqual(constant.status, "SAFE")
+        self.assertTrue(constant.safe_bases)
+        self.assertFalse(constant.risk_bases)
+        self.assertEqual(unknown.status, "UNKNOWN")
+
+    def test_saved_study_revision_preserves_unrelated_location(self):
+        import tempfile
+
+        source = 'def main(){ exec(fetch_a()); exec("safe"); }'
+        old_specs = {
+            "fetch_a": ExternalSpec("fetch_a", "旧", returns="clean", version="1")
+        }
+        result = analyze_source(source, AnalysisConfig(external_specs=old_specs))
+        with tempfile.TemporaryDirectory() as directory:
+            path = f"{directory}/study.json"
+            save_study(path, source, old_specs, result, "r1")
+            study = load_study(path)
+            revised = revise_study(
+                study,
+                {"fetch_a": ExternalSpec("fetch_a", "新", returns="tainted", version="2")},
+            )
+            statuses = [e.status for e in revised.result.explanations]
+            self.assertEqual(revised.invalidated_assumptions, ("fetch_a@1",))
+            self.assertIn("CONDITIONAL_RISK", statuses)
+            self.assertIn("SAFE", statuses)
+            self.assertEqual(len(revised.changes), 1)
+            self.assertEqual(revised.changes[0].old_status, "ASSUMED_SAFE")
 
 
 if __name__ == "__main__":
