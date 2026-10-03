@@ -52,6 +52,21 @@ def 函数名(参数, ...) { 语句; ... }
 - **临时关闭假设**：`AnalysisConfig(disabled_assumptions={"lib@v1"})` 可临时
   撤回一项或一组说明；关闭后相关路径回到未知外部调用语义，可比较已证实风险、
   条件风险、无法判断和独立安全路径的变化。
+
+- **互斥行为假设与情景分析**：`AnalysisConfig(hypotheses=(BehaviorHypothesis(...), ...))`
+  允许研究者成组提出外部行为假设（`returns` 语义同说明，`site="行:列"` 可限定
+  到具体调用实例）。两条假设若对**同一次调用**给出互斥结果（如 clean 与 tainted、
+  或实参带污点时的 clean 与 propagate），分析器记录 `ConflictRecord`（最小依据：
+  调用位置 + 两条约束），既不把互斥假设拼成一条可行风险路径，也不因没有剩余路径
+  就宣称安全（此时结论为 `INCOMPLETE` 而非 `SAFE`）。`AnalysisResult.scenarios` 把
+  假设组织成需要共同成立的情景：整组矛盾时给出 `CONTRADICTORY` 总情景，再枚举
+  最大无冲突子集，分别报告 `FEASIBLE_RISK` / `NO_RISK_FOUND` / `UNDECIDABLE`，
+  每条路径标注可行/被阻断。多处独立冲突各自记录，撤回一项假设
+  （`disabled_assumptions`）只解除涉及它的冲突；不同调用实例上的相似假设不会被
+  误判为同一处矛盾；递归截断与未知返回值保持 UNKNOWN，不靠补默认结果消除。
+  修订后 `RevisionReport.risk_changes` 区分风险变化来自 `conflict_resolved` /
+  `conflict_introduced` 还是 `path_changed` / `spec_changed`，旧情景保留在
+  `old_snapshot.scenarios` 中可单独回看。
 - **研究快照与增量修订**：`snapshot_analysis(source, config)` 保存源码、说明、
   说明版本、结论位置和解释；`ResearchSnapshot.save()/load()` 可持久化为 JSON。
   `revise_specs(snapshot, new_specs, disabled_assumptions=...)` 重算后按稳定

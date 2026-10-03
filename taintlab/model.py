@@ -82,6 +82,37 @@ class ConclusionExplanation:
     common_assumptions: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class ConflictRecord:
+    """两条行为假设对同一次调用给出互斥结果的最小依据。"""
+
+    conflict_id: str
+    call: str
+    loc: Loc
+    hypotheses: tuple[str, ...]
+    constraints: tuple[str, ...]
+    detail: str
+
+
+@dataclass(frozen=True)
+class ScenarioConclusion:
+    """某一情景下单个结论位置的可行/被阻断依据。"""
+
+    conclusion_id: str
+    state: str  # FEASIBLE_RISK | NO_RISK_FOUND | UNDECIDABLE
+    feasible_paths: tuple[PathExplanation, ...] = ()
+    blocked_paths: tuple[PathExplanation, ...] = ()
+
+
+@dataclass(frozen=True)
+class ScenarioReport:
+    """一组需要共同成立的假设在该情景下的分析结果。"""
+
+    scenario_id: str
+    hypotheses: tuple[str, ...]
+    state: str  # CONTRADICTORY | FEASIBLE_RISK | NO_RISK_FOUND | UNDECIDABLE
+    conflicts: tuple[str, ...] = ()
+    conclusions: tuple[ScenarioConclusion, ...] = ()
 class Verdict(str, Enum):
     UNSAFE = "UNSAFE"        # 发现污点到达 sink
     ASSUMED = "ASSUMED"      # 风险或安全结论依赖外部行为假设
@@ -97,6 +128,8 @@ class AnalysisResult:
     notes: list[str]
     assumptions: tuple[AssumptionRecord, ...] = ()
     explanations: tuple[ConclusionExplanation, ...] = ()
+    conflicts: tuple[ConflictRecord, ...] = ()
+    scenarios: tuple[ScenarioReport, ...] = ()
 
     def format_text(self) -> str:
         lines = [f"分析结论: {self.verdict.value}"]
@@ -123,6 +156,25 @@ class AnalysisResult:
                     lines.append(f"    {hop.loc}  [{hop.kind}] {hop.text}")
         for note in self.notes:
             lines.append(f"NOTE: {note}")
+        for conflict in self.conflicts:
+            lines.append(
+                f"CONFLICT {conflict.conflict_id}: {conflict.detail} @ {conflict.loc}"
+            )
+            for constraint in conflict.constraints:
+                lines.append(f"    约束: {constraint}")
+        for scenario in self.scenarios:
+            lines.append(
+                f"SCENARIO {scenario.scenario_id}: {scenario.state} "
+                f"假设={', '.join(scenario.hypotheses) or '(无)'}"
+            )
+            for conflict_id in scenario.conflicts:
+                lines.append(f"    冲突: {conflict_id}")
+            for conclusion in scenario.conclusions:
+                lines.append(
+                    f"    {conclusion.conclusion_id}: {conclusion.state} "
+                    f"(可行 {len(conclusion.feasible_paths)} 条, "
+                    f"被阻断 {len(conclusion.blocked_paths)} 条)"
+                )
         for explanation in self.explanations:
             lines.append(
                 f"CONCLUSION {explanation.conclusion_id}: {explanation.state} "
