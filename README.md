@@ -49,14 +49,35 @@ def 函数名(参数, ...) { 语句; ... }
   表示：`(A) 或 (B)` 中 A、B 都不是不可或缺；只有所有替代路径共同需要、且
   删除后该路径无法成立的假设才进入 `indispensable_assumptions`。安全常量、
   语言内净化路径以 `kind="safe"` 独立保存；与未知/风险分支合流时不会相互吞没。
+- **相互矛盾的行为假设**：`AnalysisConfig(spec_alternatives=...)` 可登记同一
+  外部函数的额外候选说明（如不同版本）。两条候选对**同一次调用**给出互斥
+  结果（干净值 vs 不可信值）时记为 `AssumptionConflict`：冲突 ID 含函数名与
+  调用位置，`constraints` 列出每条假设在该次调用上的互斥约束。冲突按调用
+  实例判定——同一假设作用于不同调用实例不算自相矛盾；多处独立冲突各自
+  独立，撤回一项假设只解除涉及它的冲突，其余冲突保留。
+- **情景化解释**：`AnalysisResult.scenarios` 把每个结论位置上的依据组织成
+  需要共同成立的情景：`risk`（存在可行风险）/ `contradictory`（假设组内部
+  互斥、无法共同成立）/ `no_risk`（当前依据下未发现风险）/ `undecidable`
+  （含未知返回值或递归截断，无法判断）。`ConclusionExplanation` 进一步区分：
+  `compatible_groups`（彼此相容、可共同采用的替代依据）、
+  `scenario_only_groups`（互相冲突、只能分情景讨论的依据）与
+  `infeasible_assumption_groups`（含互斥假设、拼不成可行路径的依据）。
+  若所有风险路径都依赖互斥假设，结论是 `INCOMPLETE` 而非 `SAFE`——
+  矛盾前提推不出空洞的安全结论；未知返回值与递归截断也不会被补出默认
+  结果来消除不确定性。
 - **临时关闭假设**：`AnalysisConfig(disabled_assumptions={"lib@v1"})` 可临时
   撤回一项或一组说明；关闭后相关路径回到未知外部调用语义，可比较已证实风险、
-  条件风险、无法判断和独立安全路径的变化。
+  条件风险、无法判断和独立安全路径的变化。撤回冲突中的一方后，被冲突
+  锁死的路径重新可能。
 - **研究快照与增量修订**：`snapshot_analysis(source, config)` 保存源码、说明、
-  说明版本、结论位置和解释；`ResearchSnapshot.save()/load()` 可持久化为 JSON。
-  `revise_specs(snapshot, new_specs, disabled_assumptions=...)` 重算后按稳定
-  sink 位置输出 `affected_conclusions` 与 `reused_conclusions`，未受说明变更
-  影响的解释沿用旧对象，风险位置和采用的假设版本仍可对应回之前研究。
+  说明版本、候选假设、冲突、情景、结论位置和解释；`ResearchSnapshot.save()/load()`
+  可持久化为 JSON。`revise_specs(snapshot, new_specs, disabled_assumptions=...,
+  spec_alternatives=...)` 重算后按稳定 sink 位置输出 `affected_conclusions` 与
+  `reused_conclusions`，未受说明变更影响的解释沿用旧对象；`RevisionReport` 另
+  给出 `resolved_conflicts` / `new_conflicts` / `remaining_conflicts`，并把结论
+  变化归因为 `conflict_driven_conclusions`（冲突解除）与
+  `path_driven_conclusions`（程序路径变化）。旧快照中的冲突、情景与结论可
+  单独回看，与修订后的结果对照。
 
 三类证据分开诊断：`TAINT-FLOW` / `CONFIRMED`（已证实）、
 `TAINT-ASSUMED` / `ASSUMED`（依赖外部说明）、`TAINT-UNCERTAIN` /

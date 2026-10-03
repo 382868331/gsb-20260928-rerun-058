@@ -185,6 +185,213 @@ class TaintAnalysisTests(unittest.TestCase):
         kinds = [h.kind for h in diagnostic.paths[0].hops]
         self.assertEqual(kinds, ["source", "unknown", "sink"])
 
+    def test_conflicting_specs_traced_to_call_and_constraints(self):
+        source = "def main(){ x = read_input(); y = lib(x); exec(y); }"
+        config = AnalysisConfig(
+            external_specs={
+                "lib": ExternalSpec("lib", "v1 返回干净值", "clean", version="v1")
+            },
+            spec_alternatives=(
+                ExternalSpec("lib", "v2 返回不可信值", "tainted", version="v2"),
+            ),
+        )
+        result = analyze_source(source, config)
+        self.assertEqual(len(result.conflicts), 1)
+        conflict = result.conflicts[0]
+        self.assertEqual(conflict.name, "lib")
+        self.assertEqual((conflict.loc.line, conflict.loc.col), (1, 35))
+        self.assertEqual(set(conflict.assumptions), {"lib@v1", "lib@v2"})
+        self.assertTrue(any("干净值" in c for c in conflict.constraints))
+        self.assertTrue(any("不可信值" in c for c in conflict.constraints))
+        self.assertTrue(any("互斥" in note for note in result.notes))
+
+    def test_contradictory_premise_yields_no_vacuous_safety(self):
+        source = "def main(){ x = read_input(); y = lib(x); exec(y); }"
+        config = AnalysisConfig(
+            external_specs={
+                "lib": ExternalSpec("lib", "v1 干净", "clean", version="v1")
+            },
+            spec_alternatives=(
+                ExternalSpec("lib", "v2 不可信", "tainted", version="v2"),
+            ),
+        )
+        result = analyze_source(source, config)
+        self.assertIs(result.verdict, Verdict.ASSUMED)
+        risk_scenarios = [s for s in result.scenarios if s.state == "risk"]
+        self.assertEqual(len(risk_scenarios), 1)
+        self.assertEqual(risk_scenarios[0].assumptions, ("lib@v2",))
+        explanation = result.explanations[0]
+        self.assertEqual(explanation.compatible_groups, (("lib@v2",),))
+        self.assertEqual(explanation.infeasible_assumption_groups, ())
+
+    def test_retracting_assumption_reopens_paths(self):
+        source = "def main(){ x = read_input(); y = lib(x); exec(y); }"
+        specs = {"lib": ExternalSpec("lib", "v1 干净", "clean", version="v1")}
+        alts = (ExternalSpec("lib", "v2 不可信", "tainted", version="v2"),)
+        base = AnalysisConfig(external_specs=specs, spec_alternatives=alts)
+        self.assertEqual(len(analyze_source(source, base).conflicts), 1)
+        withdrawn_v1 = analyze_source(
+            source,
+            AnalysisConfig(
+                external_specs=specs,
+                spec_alternatives=alts,
+                disabled_assumptions={"lib@v1"},
+            ),
+        )
+        self.assertEqual(withdrawn_v1.conflicts, ())
+        self.assertEqual(
+            [s.assumptions for s in withdrawn_v1.scenarios if s.state == "risk"],
+            [("lib@v2",)],
+        )
+        withdrawn_v2 = analyze_source(
+            source,
+            AnalysisConfig(
+                external_specs=specs,
+                spec_alternatives=alts,
+                disabled_assumptions={"lib@v2"},
+            ),
+        )
+        self.assertEqual(withdrawn_v2.conflicts, ())
+        self.assertEqual(
+            [s.state for s in withdrawn_v2.scenarios], ["no_risk"]
+        )
+
+    def test_multiple_independent_conflicts_resolved_separately(self):
+        source = (
+            "def main(){ x = read_input(); y = lib(x); z = net(x);"
+            " exec(y); eval_sql(z); }"
+        )
+        specs = {
+            "lib": ExternalSpec("lib", "lib v1 干净", "clean", version="v1"),
+            "net": ExternalSpec("net", "net v1 干净", "clean", version="v1"),
+        }
+        alts = (
+            ExternalSpec("lib", "lib v2 不可信", "tainted", version="v2"),
+            ExternalSpec("net", "net v2 不可信", "tainted", version="v2"),
+        )
+        _, snapshot = snapshot_analysis(
+            source, AnalysisConfig(external_specs=specs, spec_alternatives=alts)
+        )
+        self.assertEqual(len(snapshot.conflicts), 2)
+        new_specs = {
+            "lib": ExternalSpec("lib", "lib v2 不可信", "tainted", version="v2"),
+            "net": specs["net"],
+        }
+        result, report, _ = revise_specs(snapshot, new_specs)
+        self.assertEqual(len(report.resolved_conflicts), 1)
+        self.assertIn("net:1:47#net@v1|net@v2", report.remaining_conflicts)
+        self.assertEqual(len(result.conflicts), 1)
+        self.assertEqual(report.conflict_driven_conclusions, ("exec:1:55",))
+        self.assertEqual(report.path_driven_conclusions, ())
+        self.assertEqual(report.reused_conclusions, ("eval_sql:1:64",))
+
+    def test_path_change_attributed_separately_from_conflict(self):
+        source = "def main(){ x = read_input(); y = lib(x); exec(y); }"
+        specs = {"lib": ExternalSpec("lib", "v1 干净", "clean", version="v1")}
+        alts = (ExternalSpec("lib", "v2 不可信", "tainted", version="v2"),)
+        _, snapshot = snapshot_analysis(
+            source, AnalysisConfig(external_specs=specs, spec_alternatives=alts)
+        )
+        new_specs = {
+            "lib": ExternalSpec("lib", "v3 不可信", "tainted", version="v3")
+        }
+        _, report, _ = revise_specs(snapshot, new_specs, spec_alternatives=())
+        self.assertIn("exec:1:43", report.path_driven_conclusions)
+
+    def test_same_hypothesis_at_different_call_instances_not_conflict(self):
+        source = (
+            "def main(){ x = read_input(); a = lib(x); b = lib(x);"
+            " exec(a + b); }"
+        )
+        config = AnalysisConfig(
+            external_specs={
+                "lib": ExternalSpec("lib", "v1 干净", "clean", version="v1")
+            },
+            spec_alternatives=(
+                ExternalSpec("lib", "v2 不可信", "tainted", version="v2"),
+            ),
+        )
+        result = analyze_source(source, config)
+        self.assertEqual(len(result.conflicts), 2)
+        self.assertEqual(
+            {c.conflict_id for c in result.conflicts},
+            {"lib:1:35#lib@v1|lib@v2", "lib:1:47#lib@v1|lib@v2"},
+        )
+        explanation = result.explanations[0]
+        self.assertEqual(explanation.scenario_only_groups, ())
+        self.assertEqual(explanation.compatible_groups, (("lib@v2",),))
+
+    def test_unknown_and_recursion_stay_undecidable_with_candidates(self):
+        source = (
+            "def main(){ x = read_input(); y = lib(x); z = mystery(x);"
+            " exec(y); eval_sql(z); }"
+        )
+        config = AnalysisConfig(
+            external_specs={
+                "lib": ExternalSpec("lib", "v1 干净", "clean", version="v1")
+            },
+            spec_alternatives=(
+                ExternalSpec("lib", "v2 不可信", "tainted", version="v2"),
+            ),
+        )
+        result = analyze_source(source, config)
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+        states = {s.conclusion_id: s.state for s in result.scenarios}
+        self.assertEqual(states["eval_sql:1:68"], "undecidable")
+        self.assertEqual(states["exec:1:59"], "risk")
+
+    def test_confirmed_and_constant_paths_unaffected_by_conflicts(self):
+        source = (
+            "def main(){ x = read_input(); y = lib(x);"
+            " exec(\"ls\"); exec(x); eval_sql(y); }"
+        )
+        config = AnalysisConfig(
+            external_specs={
+                "lib": ExternalSpec("lib", "v1 干净", "clean", version="v1")
+            },
+            spec_alternatives=(
+                ExternalSpec("lib", "v2 不可信", "tainted", version="v2"),
+            ),
+        )
+        result = analyze_source(source, config)
+        self.assertIs(result.verdict, Verdict.UNSAFE)
+        states = {e.conclusion_id: e.state for e in result.explanations}
+        self.assertEqual(states["exec:1:43"], "CONFIRMED_SAFE")
+        self.assertEqual(states["exec:1:55"], "CONFIRMED_RISK")
+        self.assertEqual(states["eval_sql:1:64"], "CONDITIONAL_RISK")
+        self.assertEqual(len(result.conflicts), 1)
+
+    def test_snapshot_roundtrip_preserves_conflicts_and_scenarios(self):
+        source = "def main(){ x = read_input(); y = lib(x); exec(y); }"
+        config = AnalysisConfig(
+            external_specs={
+                "lib": ExternalSpec("lib", "v1 干净", "clean", version="v1")
+            },
+            spec_alternatives=(
+                ExternalSpec("lib", "v2 不可信", "tainted", version="v2"),
+            ),
+        )
+        _, snapshot = snapshot_analysis(source, config)
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "snap.json"
+            snapshot.save(path)
+            loaded = type(snapshot).load(path)
+        self.assertEqual(
+            [c.conflict_id for c in loaded.conflicts],
+            [c.conflict_id for c in snapshot.conflicts],
+        )
+        self.assertEqual(
+            [(s.scenario_id, s.state, s.assumptions) for s in loaded.scenarios],
+            [(s.scenario_id, s.state, s.assumptions) for s in snapshot.scenarios],
+        )
+        self.assertEqual(loaded.alternatives, snapshot.alternatives)
+        _, report, new_snapshot = revise_specs(
+            loaded,
+            {"lib": ExternalSpec("lib", "v2 不可信", "tainted", version="v2")},
+        )
+        self.assertEqual(len(report.old_snapshot.conflicts), 1)
+        self.assertEqual(len(new_snapshot.conflicts), 0)
+
     def test_unknown_zero_arg_return_to_sink_is_not_safe(self):
         # 回归：无参数的未知函数返回值曾被当成干净数据，导致漏报。
         source = "def main(){ token = get_token(); exec(token); }"

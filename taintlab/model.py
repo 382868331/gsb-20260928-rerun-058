@@ -66,6 +66,7 @@ class PathExplanation:
     evidence: Evidence
     assumptions: tuple[str, ...] = ()
     kind: str = "risk"  # risk | safe | unknown
+    assumption_sites: tuple[tuple[str, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,31 @@ class ConclusionExplanation:
     assumption_groups: tuple[tuple[str, ...], ...] = ()
     indispensable_assumptions: tuple[str, ...] = ()
     common_assumptions: tuple[str, ...] = ()
+    infeasible_assumption_groups: tuple[tuple[str, ...], ...] = ()
+    compatible_groups: tuple[tuple[str, ...], ...] = ()
+    scenario_only_groups: tuple[tuple[str, ...], ...] = ()
+
+
+@dataclass(frozen=True)
+class AssumptionConflict:
+    """两条假设对同一次调用给出互斥结果的最小依据。"""
+
+    conflict_id: str
+    name: str
+    loc: Loc
+    assumptions: tuple[str, ...]
+    constraints: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Scenario:
+    """一个需要共同成立的情景：一组假设在某个结论位置上的组合。"""
+
+    scenario_id: str
+    conclusion_id: str
+    assumptions: tuple[str, ...]
+    state: str  # contradictory | risk | no_risk | undecidable
+    conflicts: tuple[str, ...] = ()
 
 
 class Verdict(str, Enum):
@@ -97,6 +123,8 @@ class AnalysisResult:
     notes: list[str]
     assumptions: tuple[AssumptionRecord, ...] = ()
     explanations: tuple[ConclusionExplanation, ...] = ()
+    conflicts: tuple[AssumptionConflict, ...] = ()
+    scenarios: tuple[Scenario, ...] = ()
 
     def format_text(self) -> str:
         lines = [f"分析结论: {self.verdict.value}"]
@@ -141,4 +169,43 @@ class AnalysisResult:
                     "    共同且不可或缺的假设: "
                     + ", ".join(explanation.indispensable_assumptions)
                 )
+            if explanation.infeasible_assumption_groups:
+                lines.append(
+                    "    互斥假设组（无法共同成立）: "
+                    + " 或 ".join(
+                        "(" + ", ".join(group) + ")"
+                        for group in explanation.infeasible_assumption_groups
+                    )
+                )
+            if explanation.compatible_groups:
+                lines.append(
+                    "    可共同采用的替代依据: "
+                    + " 或 ".join(
+                        "(" + ", ".join(group) + ")"
+                        for group in explanation.compatible_groups
+                    )
+                )
+            if explanation.scenario_only_groups:
+                lines.append(
+                    "    只能分情景讨论的依据: "
+                    + " 或 ".join(
+                        "(" + ", ".join(group) + ")"
+                        for group in explanation.scenario_only_groups
+                    )
+                )
+        for conflict in self.conflicts:
+            lines.append(
+                "CONFLICT " + conflict.conflict_id + ": " + conflict.name
+                + " 于 " + str(conflict.loc) + " 假设 "
+                + " 与 ".join(conflict.assumptions) + " 互斥"
+            )
+            for constraint in conflict.constraints:
+                lines.append("    " + constraint)
+        for scenario in self.scenarios:
+            lines.append(
+                "SCENARIO " + scenario.scenario_id + " [" + scenario.state + "]: "
+                + (", ".join(scenario.assumptions) or "（无外部假设）")
+            )
+            for conflict_id in scenario.conflicts:
+                lines.append("    涉及冲突: " + conflict_id)
         return "\n".join(lines)

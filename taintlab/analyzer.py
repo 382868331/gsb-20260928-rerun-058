@@ -48,6 +48,8 @@ from .model import (
     Severity,
     TaintPath,
     Verdict,
+    AssumptionConflict,
+    Scenario,
 )
 from .parser import parse
 
@@ -95,6 +97,8 @@ class Fact:
     evidence: Evidence = Evidence.CONFIRMED
     assumptions: frozenset[str] = frozenset()
     safe: bool = False
+    # 假设作用的调用实例：(假设 ID, 行, 列)，冲突按调用实例判定。
+    sites: frozenset = frozenset()
 
     def extended(self, hop: PathHop) -> "Fact":
         return replace(self, path=self.path + (hop,))
@@ -109,6 +113,9 @@ class Fact:
             evidence=evidence,
             assumptions=self.assumptions | (assumptions or frozenset()),
         )
+
+    def with_sites(self, sites: frozenset) -> "Fact":
+        return replace(self, sites=self.sites | sites)
 
 
 @dataclass(frozen=True)
@@ -185,9 +192,12 @@ class ResearchSnapshot:
     explanations: tuple[ConclusionExplanation, ...]
     assumptions: tuple[AssumptionRecord, ...]
     created_at: str
+    conflicts: tuple[AssumptionConflict, ...] = ()
+    scenarios: tuple[Scenario, ...] = ()
+    alternatives: tuple[ExternalSpec, ...] = ()
 
     @classmethod
-    def from_result(cls, source, result, specs, disabled_assumptions=()):
+    def from_result(cls, source, result, specs, disabled_assumptions=(), alternatives=()):
         return cls(
             source=source,
             specs=_spec_dict(specs),
@@ -196,6 +206,9 @@ class ResearchSnapshot:
             explanations=result.explanations,
             assumptions=result.assumptions,
             created_at=datetime.now(timezone.utc).isoformat(),
+            conflicts=result.conflicts,
+            scenarios=result.scenarios,
+            alternatives=tuple(alternatives),
         )
 
     def to_json(self):
@@ -237,6 +250,21 @@ class ResearchSnapshot:
                 _decode_assumption(item) for item in data["assumptions"]
             ),
             created_at=data["created_at"],
+            conflicts=tuple(
+                _decode_conflict(item) for item in data.get("conflicts", ())
+            ),
+            scenarios=tuple(
+                _decode_scenario(item) for item in data.get("scenarios", ())
+            ),
+            alternatives=tuple(
+                ExternalSpec(
+                    spec["name"],
+                    spec["description"],
+                    spec["returns"],
+                    spec.get("version"),
+                )
+                for spec in data.get("alternatives", ())
+            ),
         )
 
 
@@ -247,6 +275,13 @@ class RevisionReport:
     changes: tuple[SpecVersionChange, ...]
     affected_conclusions: tuple[str, ...]
     reused_conclusions: tuple[str, ...]
+    # 修订后解除 / 新增 / 仍然存在的假设冲突（按冲突 ID）。
+    resolved_conflicts: tuple[str, ...] = ()
+    new_conflicts: tuple[str, ...] = ()
+    remaining_conflicts: tuple[str, ...] = ()
+    # 风险变化归因：来自冲突解除的结论与来自程序路径变化的结论。
+    conflict_driven_conclusions: tuple[str, ...] = ()
+    path_driven_conclusions: tuple[str, ...] = ()
 
 
 def _json_default(value):
@@ -286,6 +321,9 @@ def _decode_explanation(data):
                 evidence=Evidence(item["evidence"]),
                 assumptions=tuple(item["assumptions"]),
                 kind=item["kind"],
+                assumption_sites=tuple(
+                    tuple(site) for site in item.get("assumption_sites", ())
+                ),
             )
             for item in data["path_explanations"]
         ),
@@ -294,6 +332,36 @@ def _decode_explanation(data):
         ),
         indispensable_assumptions=tuple(data["indispensable_assumptions"]),
         common_assumptions=tuple(data["common_assumptions"]),
+        infeasible_assumption_groups=tuple(
+            tuple(group)
+            for group in data.get("infeasible_assumption_groups", ())
+        ),
+        compatible_groups=tuple(
+            tuple(group) for group in data.get("compatible_groups", ())
+        ),
+        scenario_only_groups=tuple(
+            tuple(group) for group in data.get("scenario_only_groups", ())
+        ),
+    )
+
+
+def _decode_conflict(data):
+    return AssumptionConflict(
+        conflict_id=data["conflict_id"],
+        name=data["name"],
+        loc=_decode_loc(data["loc"]),
+        assumptions=tuple(data["assumptions"]),
+        constraints=tuple(data["constraints"]),
+    )
+
+
+def _decode_scenario(data):
+    return Scenario(
+        scenario_id=data["scenario_id"],
+        conclusion_id=data["conclusion_id"],
+        assumptions=tuple(data["assumptions"]),
+        state=data["state"],
+        conflicts=tuple(data.get("conflicts", ())),
     )
 
 
@@ -317,6 +385,7 @@ def snapshot_analysis(source, config=None):
         result,
         config.external_specs,
         config.disabled_assumptions,
+        config.spec_alternatives,
     )
     return result, snapshot
 
@@ -330,11 +399,15 @@ class AnalysisConfig:
     max_call_depth: int = 32
     external_specs: dict[str, ExternalSpec] | None = None
     disabled_assumptions: frozenset[str] | set[str] | tuple[str, ...] = ()
+    # 额外的候选行为假设（如同一函数的不同版本），与 external_specs 一起
+    # 构成假设空间；对同一次调用给出互斥结果的候选会被记为冲突。
+    spec_alternatives: tuple[ExternalSpec, ...] = ()
 
     def __post_init__(self) -> None:
         if self.external_specs is None:
             self.external_specs = {}
         self.disabled_assumptions = frozenset(self.disabled_assumptions)
+        self.spec_alternatives = tuple(self.spec_alternatives)
 
 
 class Analyzer:
@@ -350,6 +423,10 @@ class Analyzer:
         self._spec_deps: set[str] = set()
         self._spec_uses: dict[str, dict] = {}
         self._explanations: list[ConclusionExplanation] = []
+        self._conflicts: dict[str, AssumptionConflict] = {}
+        self._scenarios: list[Scenario] = []
+        self._contradiction_only = False
+        self._has_feasible_assumed_risk = False
 
     # ---------- 对外入口 ----------
 
@@ -375,6 +452,17 @@ class Analyzer:
             for d in self.diagnostics
         ):
             verdict = Verdict.UNSAFE
+        elif (
+            self._contradiction_only
+            and not self._has_feasible_assumed_risk
+        ):
+            # 剩余风险路径全部依赖互斥假设：既不能拼成可行风险路径，
+            # 也不能因为前提矛盾就宣称程序安全（空洞的安全结论）。
+            verdict = Verdict.INCOMPLETE
+            self.notes.append(
+                "所有风险路径都依赖互相矛盾的假设，不存在实际可行的风险路径；"
+                "但矛盾前提不能推出安全结论，整体无法判定"
+            )
         elif assumptions or any(
             d.evidence == Evidence.ASSUMED for d in self.diagnostics
         ):
@@ -382,6 +470,12 @@ class Analyzer:
         else:
             verdict = Verdict.SAFE
         return verdict, self.diagnostics, self.notes, assumptions
+
+    def conflicts_result(self) -> tuple[AssumptionConflict, ...]:
+        return tuple(self._conflicts.values())
+
+    def scenarios_result(self) -> tuple[Scenario, ...]:
+        return tuple(self._scenarios)
 
     def explanations_result(self) -> tuple[ConclusionExplanation, ...]:
         return tuple(self._explanations)
@@ -596,87 +690,30 @@ class Analyzer:
         """
 
         propagated = frozenset().union(*arg_facts) if arg_facts else frozenset()
-        spec = self.config.external_specs.get(call.func)
-        if spec is not None:
-            assumption_id = spec_assumption_id(spec.name, spec.version)
-            if assumption_id in self.config.disabled_assumptions:
-                spec = None
-        if spec is not None:
-            assumption_id = spec_assumption_id(spec.name, spec.version)
-            external_hop = PathHop(
-                call.loc,
-                "external",
-                "外部调用 "
-                f"{call.func}() 按说明 "
-                f"{spec_assumption_id(spec.name, spec.version)} 判定",
-            )
-            incoming_paths = tuple(
-                TaintPath(f.path + (external_hop,))
-                for facts in arg_facts
-                for f in facts
-            )
-            self._record_spec_use(spec, call.loc, incoming_paths)
-            self.notes.append(
-                f"{call.loc}: 外部调用 {call.func}() 按提供的行为说明 "
-                f"({assumption_id}, returns={spec.returns}) 判定：{spec.description}"
-            )
-            if spec.returns == "clean":
-                return frozenset(
-                    {
-                        Fact(
-                            ("spec_safe", call.func, call.loc.line, call.loc.col),
-                            (
-                                PathHop(
-                                    call.loc,
-                                    "external",
-                                    f"外部调用 {call.func}() 按说明返回干净值：{spec.description}",
-                                ),
-                            ),
-                            evidence=Evidence.ASSUMED,
-                            assumptions=frozenset({assumption_id}),
-                            safe=True,
-                        )
-                    }
-                )
-            if spec.returns == "tainted":
-                origin = ("spec_source", call.func, call.loc.line, call.loc.col)
-                hop = PathHop(
+        candidates = self._spec_candidates(call.func)
+        if candidates:
+            self._detect_conflicts(call, candidates, propagated)
+            result: set[Fact] = set()
+            for spec in candidates:
+                assumption_id = spec_assumption_id(spec.name, spec.version)
+                external_hop = PathHop(
                     call.loc,
                     "external",
-                    f"外部调用 {call.func}() 按说明视为不可信来源：{spec.description}",
+                    "外部调用 "
+                    f"{call.func}() 按说明 {assumption_id} 判定",
                 )
-                return frozenset(
-                    {
-                        Fact(
-                            origin,
-                            (hop,),
-                            evidence=Evidence.ASSUMED,
-                            assumptions=frozenset({assumption_id}),
-                        )
-                    }
+                incoming_paths = tuple(
+                    TaintPath(f.path + (external_hop,))
+                    for facts in arg_facts
+                    for f in facts
                 )
-            result = set()
-            unsafe = frozenset(f for f in propagated if not f.safe)
-            for fact in unsafe:
-                extended = fact.extended(external_hop)
-                if fact.evidence == Evidence.UNKNOWN:
-                    result.add(extended)
-                else:
-                    result.add(
-                        extended.with_evidence(
-                            Evidence.ASSUMED,
-                            frozenset({assumption_id}),
-                        )
-                    )
-            if not unsafe:
-                result.add(
-                    Fact(
-                        ("spec_safe", call.func, call.loc.line, call.loc.col),
-                        (external_hop,),
-                        evidence=Evidence.ASSUMED,
-                        assumptions=frozenset({assumption_id}),
-                        safe=True,
-                    )
+                self._record_spec_use(spec, call.loc, incoming_paths)
+                self.notes.append(
+                    f"{call.loc}: 外部调用 {call.func}() 按提供的行为说明 "
+                    f"({assumption_id}, returns={spec.returns}) 判定：{spec.description}"
+                )
+                result |= set(
+                    self._apply_spec(spec, call, propagated, external_hop)
                 )
             return frozenset(result)
 
@@ -701,6 +738,159 @@ class Analyzer:
         )
         unknown_fact = Fact(key, (hop,), evidence=Evidence.UNKNOWN)
         return facts | frozenset({unknown_fact})
+
+    def _spec_candidates(self, name: str) -> list[ExternalSpec]:
+        """当前生效的候选行为假设：启用的说明 + 未撤回的候选版本。"""
+
+        disabled = self.config.disabled_assumptions
+        candidates: list[ExternalSpec] = []
+        seen: set[str] = set()
+        active = self.config.external_specs.get(name)
+        if active is not None:
+            assumption_id = spec_assumption_id(active.name, active.version)
+            if assumption_id not in disabled:
+                candidates.append(active)
+                seen.add(assumption_id)
+        for alt in self.config.spec_alternatives:
+            if alt.name != name:
+                continue
+            assumption_id = spec_assumption_id(alt.name, alt.version)
+            if assumption_id in disabled or assumption_id in seen:
+                continue
+            candidates.append(alt)
+            seen.add(assumption_id)
+        return candidates
+
+    @staticmethod
+    def _spec_outcome(spec: ExternalSpec, has_unsafe_args: bool) -> str:
+        """某条假设对本次调用的判定结果：干净值还是不可信值。"""
+
+        if spec.returns == "clean":
+            return "clean"
+        if spec.returns == "tainted":
+            return "tainted"
+        return "tainted" if has_unsafe_args else "clean"
+
+    def _detect_conflicts(
+        self,
+        call: Call,
+        candidates: list[ExternalSpec],
+        propagated: frozenset[Fact],
+    ) -> None:
+        """对同一次调用给出互斥结果的候选假设记为冲突（按调用实例）。"""
+
+        has_unsafe = any(not f.safe for f in propagated)
+        outcomes = {
+            spec_assumption_id(spec.name, spec.version): (
+                spec,
+                self._spec_outcome(spec, has_unsafe),
+            )
+            for spec in candidates
+        }
+        ids = sorted(outcomes)
+        for index, first in enumerate(ids):
+            for second in ids[index + 1:]:
+                spec_first, outcome_first = outcomes[first]
+                spec_second, outcome_second = outcomes[second]
+                if outcome_first == outcome_second:
+                    continue
+                conflict_id = (
+                    f"{call.func}:{call.loc.line}:{call.loc.col}"
+                    f"#{first}|{second}"
+                )
+                if conflict_id in self._conflicts:
+                    continue
+                label = {"clean": "干净值", "tainted": "不可信值"}
+                self._conflicts[conflict_id] = AssumptionConflict(
+                    conflict_id=conflict_id,
+                    name=call.func,
+                    loc=call.loc,
+                    assumptions=(first, second),
+                    constraints=(
+                        f"{first}: returns={spec_first.returns}，"
+                        f"本次调用结果判定为{label[outcome_first]}",
+                        f"{second}: returns={spec_second.returns}，"
+                        f"本次调用结果判定为{label[outcome_second]}",
+                    ),
+                )
+                self.notes.append(
+                    f"{call.loc}: 假设 {first} 与 {second} 对同一次 "
+                    f"{call.func}() 调用给出互斥结果，二者不能同时成立"
+                )
+
+    def _apply_spec(
+        self,
+        spec: ExternalSpec,
+        call: Call,
+        propagated: frozenset[Fact],
+        external_hop: PathHop,
+    ) -> frozenset[Fact]:
+        """按单条行为说明求本次调用的返回值事实，并绑定调用实例。"""
+
+        assumption_id = spec_assumption_id(spec.name, spec.version)
+        site = frozenset({(assumption_id, call.loc.line, call.loc.col)})
+        if spec.returns == "clean":
+            return frozenset(
+                {
+                    Fact(
+                        ("spec_safe", call.func, call.loc.line, call.loc.col),
+                        (
+                            PathHop(
+                                call.loc,
+                                "external",
+                                f"外部调用 {call.func}() 按说明返回干净值：{spec.description}",
+                            ),
+                        ),
+                        evidence=Evidence.ASSUMED,
+                        assumptions=frozenset({assumption_id}),
+                        safe=True,
+                        sites=site,
+                    )
+                }
+            )
+        if spec.returns == "tainted":
+            origin = ("spec_source", call.func, call.loc.line, call.loc.col)
+            hop = PathHop(
+                call.loc,
+                "external",
+                f"外部调用 {call.func}() 按说明视为不可信来源：{spec.description}",
+            )
+            return frozenset(
+                {
+                    Fact(
+                        origin,
+                        (hop,),
+                        evidence=Evidence.ASSUMED,
+                        assumptions=frozenset({assumption_id}),
+                        sites=site,
+                    )
+                }
+            )
+        result: set[Fact] = set()
+        unsafe = frozenset(f for f in propagated if not f.safe)
+        for fact in unsafe:
+            extended = fact.extended(external_hop).with_sites(site)
+            if fact.evidence == Evidence.UNKNOWN:
+                result.add(extended)
+            else:
+                result.add(
+                    extended.with_evidence(
+                        Evidence.ASSUMED,
+                        frozenset({assumption_id}),
+                    )
+                )
+        if not unsafe:
+            result.add(
+                Fact(
+                    ("spec_safe", call.func, call.loc.line, call.loc.col),
+                    (external_hop,),
+                    evidence=Evidence.ASSUMED,
+                    assumptions=frozenset({assumption_id}),
+                    safe=True,
+                    sites=site,
+                )
+            )
+        return frozenset(result)
 
     # ---------- 诊断 ----------
 
@@ -779,6 +969,7 @@ class Analyzer:
                         evidence=evidence,
                         assumptions=tuple(sorted(fact.assumptions)),
                         kind="risk",
+                        assumption_sites=tuple(sorted(fact.sites)),
                     )
                 )
             self.diagnostics.append(
@@ -814,6 +1005,7 @@ class Analyzer:
                     evidence=fact.evidence,
                     assumptions=tuple(sorted(fact.assumptions)),
                     kind="safe",
+                    assumption_sites=tuple(sorted(fact.sites)),
                 )
             )
         self._add_conclusion(call, tuple(all_explanations))
@@ -845,12 +1037,60 @@ class Analyzer:
         else:
             state = "CONFIRMED_SAFE"
 
-        assumption_sets = [
-            frozenset(item.assumptions)
-            for item in risky
-            if item.evidence == Evidence.ASSUMED
+        risky_assumed = [
+            item for item in risky if item.evidence == Evidence.ASSUMED
         ]
+        # 按调用实例检查每条风险依据是否自相矛盾（同一调用被两条假设
+        # 赋予互斥结果时，该依据无法共同成立，不能拼成可行风险路径）。
+        infeasible_items = [
+            item
+            for item in risky_assumed
+            if self._conflicts_for_sites(item.assumption_sites)
+        ]
+        feasible_items = [
+            item for item in risky_assumed if item not in infeasible_items
+        ]
+        if (
+            infeasible_items
+            and not feasible_items
+            and not has_confirmed
+            and not has_unknown
+        ):
+            state = "CONTRADICTORY_RISK"
+            self._contradiction_only = True
+        if feasible_items:
+            self._has_feasible_assumed_risk = True
+
+        assumption_sets = [frozenset(item.assumptions) for item in risky_assumed]
         groups = self._minimal_assumption_groups(assumption_sets)
+        infeasible_groups = self._minimal_assumption_groups(
+            [frozenset(item.assumptions) for item in infeasible_items]
+        )
+        feasible_groups = self._minimal_assumption_groups(
+            [frozenset(item.assumptions) for item in feasible_items]
+        )
+        # 替代依据之间的相容性：两组假设若在同一调用实例上互斥，
+        # 则只能分情景讨论，否则可以共同采用。
+        sites_by_group: dict[frozenset[str], set] = {}
+        for item in feasible_items:
+            sites_by_group.setdefault(
+                frozenset(item.assumptions), set()
+            ).update(item.assumption_sites)
+        scenario_only: set[frozenset[str]] = set()
+        for index, first in enumerate(feasible_groups):
+            for second in feasible_groups[index + 1:]:
+                merged_sites = list(sites_by_group.get(first, ())) + list(
+                    sites_by_group.get(second, ())
+                )
+                if self._conflicts_for_sites(merged_sites):
+                    scenario_only.add(first)
+                    scenario_only.add(second)
+        scenario_only_groups = [
+            group for group in feasible_groups if group in scenario_only
+        ]
+        compatible_groups = [
+            group for group in feasible_groups if group not in scenario_only
+        ]
         if groups:
             common = frozenset.intersection(*groups)
             indispensable = tuple(
@@ -865,9 +1105,10 @@ class Analyzer:
             )
         else:
             indispensable = ()
+        conclusion_id = self._conclusion_id(call)
         self._explanations.append(
             ConclusionExplanation(
-                conclusion_id=self._conclusion_id(call),
+                conclusion_id=conclusion_id,
                 sink=call.func,
                 loc=call.loc,
                 state=state,
@@ -877,8 +1118,87 @@ class Analyzer:
                 common_assumptions=(
                     tuple(sorted(frozenset.intersection(*groups))) if groups else ()
                 ),
+                infeasible_assumption_groups=tuple(
+                    tuple(sorted(group)) for group in infeasible_groups
+                ),
+                compatible_groups=tuple(
+                    tuple(sorted(group)) for group in compatible_groups
+                ),
+                scenario_only_groups=tuple(
+                    tuple(sorted(group)) for group in scenario_only_groups
+                ),
             )
         )
+        self._build_scenarios(
+            conclusion_id, risky, safe, infeasible_items, feasible_groups
+        )
+
+    def _conflicts_for_sites(self, sites) -> list[AssumptionConflict]:
+        """假设-调用实例集合内部存在的互斥冲突。"""
+
+        site_set = set(sites)
+        found = []
+        for conflict in self._conflicts.values():
+            first, second = conflict.assumptions
+            line, col = conflict.loc.line, conflict.loc.col
+            if (first, line, col) in site_set and (second, line, col) in site_set:
+                found.append(conflict)
+        return found
+
+    def _build_scenarios(
+        self,
+        conclusion_id: str,
+        risky,
+        safe,
+        infeasible_items,
+        feasible_groups,
+    ) -> None:
+        """把结论位置上的依据组织成需要共同成立的情景。"""
+
+        scenarios: list[Scenario] = []
+        if any(item.evidence == Evidence.CONFIRMED for item in risky):
+            scenarios.append(
+                Scenario(conclusion_id, conclusion_id, (), "risk")
+            )
+        for group in feasible_groups:
+            scenarios.append(
+                Scenario(
+                    conclusion_id,
+                    conclusion_id,
+                    tuple(sorted(group)),
+                    "risk",
+                )
+            )
+        for item in infeasible_items:
+            conflicts = self._conflicts_for_sites(item.assumption_sites)
+            scenarios.append(
+                Scenario(
+                    conclusion_id,
+                    conclusion_id,
+                    tuple(sorted(item.assumptions)),
+                    "contradictory",
+                    tuple(c.conflict_id for c in conflicts),
+                )
+            )
+        if any(item.evidence == Evidence.UNKNOWN for item in risky):
+            scenarios.append(
+                Scenario(conclusion_id, conclusion_id, (), "undecidable")
+            )
+        if not risky:
+            safe_groups = {
+                tuple(sorted(item.assumptions)) for item in safe
+            } or {()}
+            for group in sorted(safe_groups):
+                scenarios.append(
+                    Scenario(conclusion_id, conclusion_id, group, "no_risk")
+                )
+        for index, scenario in enumerate(scenarios):
+            self._scenarios.append(
+                replace(
+                    scenario,
+                    scenario_id=f"{conclusion_id}#S{index + 1}",
+                )
+            )
 
     @staticmethod
     def _minimal_assumption_groups(groups: list[frozenset[str]]) -> list[frozenset[str]]:
@@ -908,6 +1228,8 @@ def analyze_program(program: Program, config: AnalysisConfig | None = None):
         notes=notes,
         assumptions=assumptions,
         explanations=analyzer.explanations_result(),
+        conflicts=analyzer.conflicts_result(),
+        scenarios=analyzer.scenarios_result(),
     )
 
 
@@ -928,12 +1250,20 @@ def analyze_source(source: str, config: AnalysisConfig | None = None) -> "Analys
     return analyze_program(program, config)
 
 
-def revise_specs(snapshot, new_specs=None, disabled_assumptions=()):
-    """修订行为说明后重算，并按稳定结论位置标记受影响/可复用解释。"""
+def revise_specs(snapshot, new_specs=None, disabled_assumptions=(), spec_alternatives=None):
+    """修订行为说明后重算，并按稳定结论位置标记受影响/可复用解释。
 
+    未显式给出 ``spec_alternatives`` 时沿用快照中的候选假设；旧情景、
+    旧冲突保留在 ``old_snapshot`` 中可单独回看，报告按冲突解除与
+    程序路径变化归因结论变化。
+    """
+
+    if spec_alternatives is None:
+        spec_alternatives = snapshot.alternatives
     config = AnalysisConfig(
         external_specs=_spec_dict(new_specs),
         disabled_assumptions=frozenset(disabled_assumptions),
+        spec_alternatives=tuple(spec_alternatives),
     )
     result = analyze_source(snapshot.source, config)
     new_snapshot = ResearchSnapshot.from_result(
@@ -941,6 +1271,7 @@ def revise_specs(snapshot, new_specs=None, disabled_assumptions=()):
         result,
         new_specs,
         disabled_assumptions,
+        spec_alternatives,
     )
     changes = tuple(compare_external_specs(snapshot.specs, new_specs))
     changed_names = {
@@ -950,6 +1281,19 @@ def revise_specs(snapshot, new_specs=None, disabled_assumptions=()):
         assumption
         for change in changes
         for assumption in change.invalidated_assumptions
+    }
+    # 候选假设（spec_alternatives）的新增/撤回同样令相关结论失效。
+    old_alt_ids = {
+        spec_assumption_id(a.name, a.version) for a in snapshot.alternatives
+    }
+    new_alt_ids = {
+        spec_assumption_id(a.name, a.version) for a in spec_alternatives
+    }
+    changed_ids |= old_alt_ids ^ new_alt_ids
+    changed_names |= {
+        a.name
+        for a in tuple(snapshot.alternatives) + tuple(spec_alternatives)
+        if spec_assumption_id(a.name, a.version) in (old_alt_ids ^ new_alt_ids)
     }
 
     def uses_changed_spec(explanation):
@@ -993,11 +1337,55 @@ def revise_specs(snapshot, new_specs=None, disabled_assumptions=()):
     )
     result.explanations = reused_explanations
     new_snapshot = replace(new_snapshot, explanations=reused_explanations)
+    old_conflict_ids = {c.conflict_id for c in snapshot.conflicts}
+    new_conflict_ids = {c.conflict_id for c in result.conflicts}
+    resolved_conflicts = tuple(sorted(old_conflict_ids - new_conflict_ids))
+    introduced_conflicts = tuple(sorted(new_conflict_ids - old_conflict_ids))
+    remaining_conflicts = tuple(sorted(old_conflict_ids & new_conflict_ids))
+
+    # 归因：假设组本身变化记为程序路径变化；假设组不变而可行性/
+    # 状态变化（或涉及已解除冲突的假设）记为冲突解除带来的变化。
+    resolved_assumptions = {
+        assumption
+        for conflict in snapshot.conflicts
+        if conflict.conflict_id in resolved_conflicts
+        for assumption in conflict.assumptions
+    }
+    old_by_cid = {e.conclusion_id: e for e in snapshot.explanations}
+    new_by_cid = {e.conclusion_id: e for e in result.explanations}
+    conflict_driven: list[str] = []
+    path_driven: list[str] = []
+    for cid in sorted(affected):
+        old_expl = old_by_cid.get(cid)
+        new_expl = new_by_cid.get(cid)
+        old_groups = set(old_expl.assumption_groups) if old_expl else set()
+        new_groups = set(new_expl.assumption_groups) if new_expl else set()
+        involved = (old_groups | new_groups)
+        flat = {a for group in involved for a in group}
+        if old_groups != new_groups:
+            path_driven.append(cid)
+        if (
+            old_expl is not None
+            and new_expl is not None
+            and old_groups == new_groups
+            and (
+                old_expl.state != new_expl.state
+                or old_expl.infeasible_assumption_groups
+                != new_expl.infeasible_assumption_groups
+            )
+        ) or (flat & resolved_assumptions):
+            conflict_driven.append(cid)
+
     report = RevisionReport(
         old_snapshot=snapshot,
         new_snapshot=new_snapshot,
         changes=changes,
         affected_conclusions=tuple(sorted(affected)),
         reused_conclusions=reused,
+        resolved_conflicts=resolved_conflicts,
+        new_conflicts=introduced_conflicts,
+        remaining_conflicts=remaining_conflicts,
+        conflict_driven_conclusions=tuple(conflict_driven),
+        path_driven_conclusions=tuple(path_driven),
     )
     return result, report, new_snapshot
