@@ -54,6 +54,7 @@ class AssumptionRecord:
     version: str | None
     returns: str
     description: str
+    scope: str = "global"
     locations: tuple[Loc, ...] = ()
     paths: tuple[TaintPath, ...] = ()
 

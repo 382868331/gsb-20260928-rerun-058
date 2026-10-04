@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from taintlab import (
     revise_study,
     NamedScenario,
 )
+from taintlab.analyzer import ExternalSpecScope
 from taintlab.callgraph import build_call_graph
 
 
@@ -702,6 +704,188 @@ class TaintAnalysisTests(unittest.TestCase):
                 tuple(item.conclusion_id for item in loaded.explanations),
                 tuple(item.conclusion_id for item in snapshot.explanations),
             )
+
+
+class ScopedExternalSpecTests(unittest.TestCase):
+    SOURCE = (
+        "def main(){"
+        " x = read_input();"
+        " a = lib(x); b = lib(x);"
+        " exec(a); eval_sql(b);"
+        "}"
+    )
+
+    def config(self):
+        return AnalysisConfig(
+            external_specs=(
+                ExternalSpec(
+                    "lib", "第一处使用旧版净化", "clean",
+                    version="v1",
+                    scope=ExternalSpecScope.call_site(1, 35),
+                ),
+                ExternalSpec(
+                    "lib", "第二处使用新版转发", "propagate",
+                    version="v2",
+                    scope=ExternalSpecScope.call_site(1, 47),
+                ),
+            )
+        )
+
+    def test_same_library_can_use_different_versions_by_call_site(self):
+        result = analyze_source(self.SOURCE, self.config())
+        states = {e.conclusion_id: e.state for e in result.explanations}
+        self.assertEqual(states["exec:1:55"], "CONDITIONALLY_SAFE")
+        self.assertEqual(states["eval_sql:1:64"], "CONDITIONAL_RISK")
+        diagnostic = next(d for d in result.diagnostics if d.loc.col == 64)
+        self.assertEqual(diagnostic.assumptions, ("lib@v2[call::1:47]",))
+        records = {r.assumption_id: r for r in result.assumptions}
+        self.assertEqual(records["lib@v1[call::1:35]"].scope, "call::1:35")
+        self.assertEqual(records["lib@v2[call::1:47]"].scope, "call::1:47")
+        self.assertEqual(result.conflicts, ())
+
+    def test_unknown_call_does_not_inherit_nearby_sanitization(self):
+        source = (
+            "def main(){"
+            " x = read_input(); a = lib(x); b = lib(x);"
+            " exec(a); eval_sql(b);"
+            "}"
+        )
+        config = AnalysisConfig(
+            external_specs=(
+                ExternalSpec(
+                    "lib", "只有第一处净化", "clean",
+                    version="v1",
+                    scope=ExternalSpecScope.call_site(1, 35),
+                ),
+            )
+        )
+        result = analyze_source(source, config)
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+        states = {e.conclusion_id: e.state for e in result.explanations}
+        self.assertEqual(states["exec:1:55"], "CONDITIONALLY_SAFE")
+        self.assertEqual(states["eval_sql:1:64"], "UNKNOWN_RISK")
+
+    def test_file_scope_overrides_global_spec_for_entire_file(self):
+        config = AnalysisConfig(
+            external_specs=(
+                ExternalSpec("lib", "全局净化", "clean", version="v1"),
+                ExternalSpec(
+                    "lib", "本文件转发", "propagate", version="v2",
+                    scope=ExternalSpecScope.file(),
+                ),
+            )
+        )
+        result = analyze_source(self.SOURCE, config)
+        self.assertIs(result.verdict, Verdict.ASSUMED)
+        self.assertEqual(
+            sorted({a for d in result.diagnostics for a in d.assumptions}),
+            ["lib@v2[file:]"],
+        )
+        self.assertEqual(
+            sorted(r.assumption_id for r in result.assumptions),
+            ["lib@v2[file:]"],
+        )
+
+    def test_local_retraction_does_not_remove_other_call_site_basis(self):
+        local_id = "lib@v1[call::1:35]"
+        config = replace(self.config(), disabled_assumptions=frozenset({local_id}))
+        result = analyze_source(self.SOURCE, config)
+        states = {e.conclusion_id: e.state for e in result.explanations}
+        self.assertEqual(states["exec:1:55"], "UNKNOWN_RISK")
+        self.assertEqual(states["eval_sql:1:64"], "CONDITIONAL_RISK")
+        self.assertEqual(
+            [r.assumption_id for r in result.assumptions],
+            ["lib@v2[call::1:47]"],
+        )
+
+    def test_scoped_conflict_is_checked_only_at_intersecting_call(self):
+        config = AnalysisConfig(
+            external_specs=(
+                ExternalSpec(
+                    "lib", "第一处旧版净化", "clean", "v1",
+                    scope=ExternalSpecScope.call_site(1, 35),
+                ),
+            ),
+            spec_alternatives=(
+                ExternalSpec(
+                    "lib", "第一处新版不可信", "tainted", "v2",
+                    scope=ExternalSpecScope.call_site(1, 35),
+                ),
+                ExternalSpec(
+                    "lib", "第二处旧版转发", "propagate", "v1",
+                    scope=ExternalSpecScope.call_site(1, 47),
+                ),
+            ),
+        )
+        scenario = NamedScenario(
+            "mixed", "不同位置采用各自版本",
+            (
+                "lib@v2[call::1:35]",
+                "lib@v1[call::1:47]",
+            ),
+        )
+        study = study_scenarios(self.SOURCE, (scenario,), config)
+        evaluated = study.by_name("mixed")
+        self.assertTrue(evaluated.feasible)
+        self.assertEqual(evaluated.minimal_conflicts, ())
+        self.assertEqual(
+            {c.sink_id: c.state for c in evaluated.sink_conclusions},
+            {
+                "exec:1:55": "conditional_risk",
+                "eval_sql:1:64": "conditional_risk",
+            },
+        )
+
+    def test_compare_and_reload_preserve_local_and_global_basis(self):
+        old_config = self.config()
+        _, snapshot = snapshot_analysis(self.SOURCE, old_config)
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "scoped.json"
+            snapshot.save(path)
+            loaded = type(snapshot).load(path)
+
+        self.assertEqual(loaded.specs, snapshot.specs)
+        new_specs = (
+            replace(snapshot.specs[0], description="第一处更新后的净化"),
+            snapshot.specs[1],
+        )
+        changes = compare_external_specs(loaded.specs, new_specs)
+        changed = next(c for c in changes if c.status == "changed")
+        self.assertEqual(
+            changed.invalidated_assumptions,
+            ("lib@v1[call::1:35]",),
+        )
+        _, report, new_snapshot = revise_specs(loaded, new_specs)
+        self.assertIn("exec:1:55", report.affected_conclusions)
+        self.assertIn("eval_sql:1:64", report.reused_conclusions)
+        self.assertEqual(new_snapshot.specs[1], snapshot.specs[1])
+
+    def test_reload_compares_global_spec_with_local_override(self):
+        global_config = AnalysisConfig(
+            external_specs=(
+                ExternalSpec("lib", "全局净化", "clean", version="v1"),
+            )
+        )
+        _, snapshot = snapshot_analysis(self.SOURCE, global_config)
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "global-to-local.json"
+            snapshot.save(path)
+            loaded = type(snapshot).load(path)
+
+        local_override = (
+            ExternalSpec(
+                "lib", "第一处改为不可信", "tainted", "v2",
+                scope=ExternalSpecScope.call_site(1, 35),
+            ),
+        )
+        result, report, _ = revise_specs(loaded, local_override)
+        states = {e.conclusion_id: e.state for e in result.explanations}
+        self.assertEqual(states["exec:1:55"], "CONDITIONAL_RISK")
+        self.assertEqual(states["eval_sql:1:64"], "UNKNOWN_RISK")
+        self.assertEqual(
+            sorted(report.affected_conclusions),
+            ["eval_sql:1:64", "exec:1:55"],
+        )
 
 
 class NamedScenarioStudyTests(unittest.TestCase):

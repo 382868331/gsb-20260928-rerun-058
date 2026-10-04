@@ -44,6 +44,12 @@ def 函数名(参数, ...) { 语句; ... }
   说明的 sink 诊断为 `TAINT-ASSUMED`，由说明推出的安全结论总判为 `ASSUMED`。
   `compare_external_specs(old, new)` 可比较两版说明；某条说明被撤回时，只有
   使用对应假设 ID 的诊断或结论失效，其他结论不受影响。
+  - 可通过 `ExternalSpecScope.file()` 或
+    `ExternalSpecScope.call_site(line, col)` 把同一库的说明限定到文件或单个调用点。
+    `external_specs` 接受多个同库说明；窄作用域在实际匹配位置覆盖全局说明，
+    未覆盖到的调用仍按未知外部调用处理，不会继承邻近调用的净化结论。局部假设
+    ID 形如 `lib@v2[call::1:47]`，输出、冲突、撤回、快照重载和命名情景投影都
+    同时保留版本与适用范围；联合情景只在实际相交的同一个调用实例检查互斥。
 - **按结论解释最小必要假设**：`AnalysisResult.explanations` 为每个 sink 位置
   （稳定 ID：`函数名:行:列`）汇总替代路径。风险路径的假设以“最小替代假设组”
   表示：`(A) 或 (B)` 中 A、B 都不是不可或缺；只有所有替代路径共同需要、且

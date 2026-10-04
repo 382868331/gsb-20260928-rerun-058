@@ -67,6 +67,55 @@ SINKS = {
 }
 
 @dataclass(frozen=True)
+class ExternalSpecScope:
+    """外部行为说明的适用范围。
+
+    kind 取值：``global`` / ``file`` / ``call``。``call`` 必须给出
+    ``line`` 与 ``col``；``path`` 为 None 时表示当前被分析文件。
+    """
+
+    kind: str = "global"
+    line: int | None = None
+    col: int | None = None
+    path: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("global", "file", "call"):
+            raise ValueError(f"外部说明作用域非法: {self.kind}")
+        if self.kind == "call" and (self.line is None or self.col is None):
+            raise ValueError("调用点作用域必须提供 line 和 col")
+
+    @classmethod
+    def global_scope(cls) -> "ExternalSpecScope":
+        return cls("global")
+
+    @classmethod
+    def file(cls, path: str | None = None) -> "ExternalSpecScope":
+        return cls("file", path=path)
+
+    @classmethod
+    def call_site(
+        cls, line: int, col: int, path: str | None = None
+    ) -> "ExternalSpecScope":
+        return cls("call", line=line, col=col, path=path)
+
+    @property
+    def label(self) -> str:
+        if self.kind == "global":
+            return "global"
+        location = f":{self.line}:{self.col}" if self.kind == "call" else ""
+        path = f"{self.path}:" if self.path is not None else ""
+        return f"{self.kind}:{path}{location}"
+
+    def matches(self, loc: Loc) -> bool:
+        if self.kind == "global":
+            return True
+        if self.kind == "file":
+            return True
+        return self.line == loc.line and self.col == loc.col
+
+
+@dataclass(frozen=True)
 class ExternalSpec:
     """部分外部调用的受限行为说明（由使用者显式提供，分析器不臆测）。
 
@@ -83,10 +132,15 @@ class ExternalSpec:
     description: str
     returns: str = "propagate"
     version: str | None = None
+    scope: ExternalSpecScope | None = None
 
     def __post_init__(self) -> None:
         if self.returns not in ("clean", "tainted", "propagate"):
             raise ValueError(f"外部调用说明 {self.name} 的返回值策略非法: {self.returns}")
+        scope = self.scope or ExternalSpecScope.global_scope()
+        if isinstance(scope, dict):
+            scope = ExternalSpecScope(**scope)
+        object.__setattr__(self, "scope", scope)
 
 
 @dataclass(frozen=True)
@@ -126,16 +180,57 @@ class SpecVersionChange:
     old_version: str | None = None
     new_version: str | None = None
     changed_fields: tuple[str, ...] = ()
+    old_scope: str = "global"
+    new_scope: str = "global"
 
     @property
     def invalidated_assumptions(self) -> tuple[str, ...]:
         if self.status not in ("changed", "withdrawn"):
             return ()
-        return (spec_assumption_id(self.name, self.old_version),)
+        base = spec_assumption_id(self.name, self.old_version)
+        if self.old_scope == "global":
+            return (base,)
+        return (f"{base}[{self.old_scope}]",)
+
+
+def _normalize_spec_collection(specs) -> tuple[ExternalSpec, ...]:
+    if specs is None:
+        return ()
+    if isinstance(specs, dict):
+        return tuple(specs.values())
+    return tuple(specs)
+
+
+def _spec_key(spec: ExternalSpec) -> tuple[str, str, int | None, int | None, str | None]:
+    scope = spec.scope
+    return (
+        spec.name,
+        scope.kind,
+        scope.line,
+        scope.col,
+        scope.path,
+    )
 
 
 def spec_assumption_id(name: str, version: str | None) -> str:
     return f"{name}@{version}" if version is not None else name
+
+
+def scoped_spec_assumption_id(spec: ExternalSpec) -> str:
+    base = spec_assumption_id(spec.name, spec.version)
+    if spec.scope is None or spec.scope.kind == "global":
+        return base
+    return f"{base}[{spec.scope.label}]"
+
+
+def _spec_from_data(data: dict) -> ExternalSpec:
+    return ExternalSpec(
+        data["name"],
+        data["description"],
+        data["returns"],
+        data.get("version"),
+        ExternalSpecScope(**data["scope"]) if data.get("scope") else None,
+    )
 
 
 def compare_external_specs(
@@ -144,18 +239,33 @@ def compare_external_specs(
 ) -> list[SpecVersionChange]:
     """比较两版外部行为说明；撤回只返回被撤回名称对应的假设 ID。"""
 
-    old_specs = old_specs or {}
-    new_specs = new_specs or {}
+    old_specs = _normalize_spec_collection(old_specs)
+    new_specs = _normalize_spec_collection(new_specs)
     changes: list[SpecVersionChange] = []
-    for name in sorted(set(old_specs) | set(new_specs)):
-        old = old_specs.get(name)
-        new = new_specs.get(name)
+    old_by_key = {_spec_key(spec): spec for spec in old_specs}
+    new_by_key = {_spec_key(spec): spec for spec in new_specs}
+    for key in sorted(set(old_by_key) | set(new_by_key)):
+        old = old_by_key.get(key)
+        new = new_by_key.get(key)
+        name = key[0]
         if old is None:
-            changes.append(SpecVersionChange(name, "added", new_version=new.version))
+            changes.append(
+                SpecVersionChange(
+                    name,
+                    "added",
+                    new_version=new.version,
+                    new_scope=new.scope.label,
+                )
+            )
             continue
         if new is None:
             changes.append(
-                SpecVersionChange(name, "withdrawn", old_version=old.version)
+                SpecVersionChange(
+                    name,
+                    "withdrawn",
+                    old_version=old.version,
+                    old_scope=old.scope.label,
+                )
             )
             continue
         changed_fields = tuple(
@@ -171,23 +281,44 @@ def compare_external_specs(
                     old.version,
                     new.version,
                     changed_fields,
+                    old.scope.label,
+                    new.scope.label,
                 )
             )
         else:
             changes.append(
-                SpecVersionChange(name, "unchanged", old.version, new.version)
+                SpecVersionChange(
+                    name,
+                    "unchanged",
+                    old.version,
+                    new.version,
+                    old_scope=old.scope.label,
+                    new_scope=new.scope.label,
+                )
             )
     return changes
 
 
 def _spec_dict(specs):
-    return dict(specs or {})
+    return _normalize_spec_collection(specs)
+
+
+class ExternalSpecCollection(tuple):
+    """主说明集合；按名称访问保留给旧版 dict API。"""
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            for spec in self:
+                if spec.name == key:
+                    return spec
+            raise KeyError(key)
+        return tuple.__getitem__(self, key)
 
 
 @dataclass(frozen=True)
 class ResearchSnapshot:
     source: str
-    specs: dict[str, ExternalSpec]
+    specs: tuple[ExternalSpec, ...]
     disabled_assumptions: frozenset[str]
     verdict: str
     explanations: tuple[ConclusionExplanation, ...]
@@ -214,7 +345,10 @@ class ResearchSnapshot:
 
     def to_json(self):
         return json.dumps(
-            asdict(self),
+            {
+                **asdict(self),
+                "specs": [asdict(spec) for spec in self.specs],
+            },
             ensure_ascii=False,
             default=_json_default,
             indent=2,
@@ -233,15 +367,14 @@ class ResearchSnapshot:
     def from_dict(cls, data):
         return cls(
             source=data["source"],
-            specs={
-                name: ExternalSpec(
-                    spec["name"],
-                    spec["description"],
-                    spec["returns"],
-                    spec.get("version"),
+            specs=tuple(
+                _spec_from_data(spec if isinstance(spec, dict) else {"name": name, **spec})
+                for name, spec in (
+                    data["specs"].items()
+                    if isinstance(data["specs"], dict)
+                    else ((item["name"], item) for item in data["specs"])
                 )
-                for name, spec in data["specs"].items()
-            },
+            ),
             disabled_assumptions=frozenset(data.get("disabled_assumptions", ())),
             verdict=data["verdict"],
             explanations=tuple(
@@ -257,15 +390,7 @@ class ResearchSnapshot:
             scenarios=tuple(
                 _decode_scenario(item) for item in data.get("scenarios", ())
             ),
-            alternatives=tuple(
-                ExternalSpec(
-                    spec["name"],
-                    spec["description"],
-                    spec["returns"],
-                    spec.get("version"),
-                )
-                for spec in data.get("alternatives", ())
-            ),
+            alternatives=tuple(_spec_from_data(spec) for spec in data.get("alternatives", ())),
         )
 
 
@@ -373,6 +498,7 @@ def _decode_assumption(data):
         version=data.get("version"),
         returns=data["returns"],
         description=data["description"],
+        scope=data.get("scope", "global"),
         locations=tuple(_decode_loc(item) for item in data["locations"]),
         paths=tuple(_decode_path(item) for item in data["paths"]),
     )
@@ -442,8 +568,8 @@ class ScenarioStudy:
                 "results": [_encode_study_result(item) for item in self.results],
                 "base_config": {
                     "external_specs": {
-                        name: asdict(spec)
-                        for name, spec in (self.base_config.external_specs or {}).items()
+                        f"{spec.name}#{index}": asdict(spec)
+                        for index, spec in enumerate(self.base_config.external_specs)
                     },
                     "disabled_assumptions": sorted(
                         self.base_config.disabled_assumptions
@@ -477,15 +603,15 @@ class ScenarioStudy:
         )
         config_data = data.get("base_config", {})
         config = AnalysisConfig(
-            external_specs={
-                name: ExternalSpec(**spec)
-                for name, spec in config_data.get("external_specs", {}).items()
-            },
+            external_specs=tuple(
+                _spec_from_data(spec)
+                for spec in config_data.get("external_specs", {}).values()
+            ),
             disabled_assumptions=frozenset(
                 config_data.get("disabled_assumptions", ())
             ),
             spec_alternatives=tuple(
-                ExternalSpec(**spec)
+                _spec_from_data(spec)
                 for spec in config_data.get("spec_alternatives", ())
             ),
         )
@@ -801,7 +927,7 @@ Env = dict[str, frozenset[Fact]]
 @dataclass
 class AnalysisConfig:
     max_call_depth: int = 32
-    external_specs: dict[str, ExternalSpec] | None = None
+    external_specs: dict[str, ExternalSpec] | tuple[ExternalSpec, ...] | list[ExternalSpec] | None = None
     disabled_assumptions: frozenset[str] | set[str] | tuple[str, ...] = ()
     # 额外的候选行为假设（如同一函数的不同版本），与 external_specs 一起
     # 构成假设空间；对同一次调用给出互斥结果的候选会被记为冲突。
@@ -809,9 +935,43 @@ class AnalysisConfig:
 
     def __post_init__(self) -> None:
         if self.external_specs is None:
-            self.external_specs = {}
+            self.external_specs = ExternalSpecCollection()
+        elif isinstance(self.external_specs, dict):
+            self.external_specs = ExternalSpecCollection(self.external_specs.values())
+        else:
+            self.external_specs = ExternalSpecCollection(self.external_specs)
         self.disabled_assumptions = frozenset(self.disabled_assumptions)
         self.spec_alternatives = tuple(self.spec_alternatives)
+
+    def specs_by_name(self) -> dict[str, ExternalSpec]:
+        """以名称暴露主说明，供旧 API 与 JSON 序列化使用。
+
+        同一名称存在局部和全局主说明时保留全局项；匹配时通过
+        ``matching_primary_spec`` 让局部项覆盖全局项。
+        """
+
+        primary: dict[str, ExternalSpec] = {}
+        for spec in self.external_specs:
+            primary.setdefault(spec.name, spec)
+        return primary
+
+    def matching_primary_spec(self, name: str, loc: Loc) -> ExternalSpec | None:
+        matching = [
+            spec
+            for spec in self.external_specs
+            if spec.name == name and spec.scope.matches(loc)
+        ]
+        if not matching:
+            return None
+
+        def rank(spec: ExternalSpec) -> tuple:
+            scope_kind = spec.scope.kind
+            return (
+                2 if scope_kind == "call" else 1 if scope_kind == "file" else 0,
+                spec.scope.col or 0,
+            )
+
+        return sorted(matching, key=rank, reverse=True)[0]
 
 
 class Analyzer:
@@ -896,6 +1056,7 @@ class Analyzer:
                     version=spec.version,
                     returns=spec.returns,
                     description=spec.description,
+                    scope=spec.scope.label,
                     locations=tuple(use["locations"]),
                     paths=tuple(use["paths"]),
                 )
@@ -908,7 +1069,7 @@ class Analyzer:
         loc: Loc,
         paths: tuple[TaintPath, ...] = (),
     ) -> str:
-        assumption_id = spec_assumption_id(spec.name, spec.version)
+        assumption_id = scoped_spec_assumption_id(spec)
         use = self._spec_uses.setdefault(
             assumption_id,
             {"spec": spec, "locations": [], "paths": []},
@@ -1094,12 +1255,12 @@ class Analyzer:
         """
 
         propagated = frozenset().union(*arg_facts) if arg_facts else frozenset()
-        candidates = self._spec_candidates(call.func)
+        candidates = self._spec_candidates(call.func, call.loc)
         if candidates:
             self._detect_conflicts(call, candidates, propagated)
             result: set[Fact] = set()
             for spec in candidates:
-                assumption_id = spec_assumption_id(spec.name, spec.version)
+                assumption_id = scoped_spec_assumption_id(spec)
                 external_hop = PathHop(
                     call.loc,
                     "external",
@@ -1143,23 +1304,48 @@ class Analyzer:
         unknown_fact = Fact(key, (hop,), evidence=Evidence.UNKNOWN)
         return facts | frozenset({unknown_fact})
 
-    def _spec_candidates(self, name: str) -> list[ExternalSpec]:
+    def _spec_candidates(self, name: str, loc: Loc) -> list[ExternalSpec]:
         """当前生效的候选行为假设：启用的说明 + 未撤回的候选版本。"""
 
         disabled = self.config.disabled_assumptions
         candidates: list[ExternalSpec] = []
         seen: set[str] = set()
-        active = self.config.external_specs.get(name)
+        active = self.config.matching_primary_spec(name, loc)
+        all_matching = tuple(
+            spec
+            for spec in tuple(self.config.external_specs) + tuple(self.config.spec_alternatives)
+            if spec.name == name and spec.scope.matches(loc)
+        )
+        if not all_matching:
+            return []
+
+        def scope_rank(spec: ExternalSpec) -> int:
+            return {"global": 0, "file": 1, "call": 2}[spec.scope.kind]
+
+        active_rank = scope_rank(active) if active is not None else -1
+        narrowest_rank = max(scope_rank(spec) for spec in all_matching)
         if active is not None:
-            assumption_id = spec_assumption_id(active.name, active.version)
-            if assumption_id not in disabled:
+            assumption_id = scoped_spec_assumption_id(active)
+            unversioned = spec_assumption_id(active.name, active.version)
+            if (
+                active_rank == narrowest_rank
+                and assumption_id not in disabled
+                and unversioned not in disabled
+            ):
                 candidates.append(active)
                 seen.add(assumption_id)
         for alt in self.config.spec_alternatives:
-            if alt.name != name:
+            if alt.name != name or not alt.scope.matches(loc):
                 continue
-            assumption_id = spec_assumption_id(alt.name, alt.version)
-            if assumption_id in disabled or assumption_id in seen:
+            if scope_rank(alt) != narrowest_rank:
+                continue
+            assumption_id = scoped_spec_assumption_id(alt)
+            unversioned = spec_assumption_id(alt.name, alt.version)
+            if (
+                assumption_id in disabled
+                or unversioned in disabled
+                or assumption_id in seen
+            ):
                 continue
             candidates.append(alt)
             seen.add(assumption_id)
@@ -1185,7 +1371,7 @@ class Analyzer:
 
         has_unsafe = any(not f.safe for f in propagated)
         outcomes = {
-            spec_assumption_id(spec.name, spec.version): (
+            scoped_spec_assumption_id(spec): (
                 spec,
                 self._spec_outcome(spec, has_unsafe),
             )
@@ -1231,7 +1417,7 @@ class Analyzer:
     ) -> frozenset[Fact]:
         """按单条行为说明求本次调用的返回值事实，并绑定调用实例。"""
 
-        assumption_id = spec_assumption_id(spec.name, spec.version)
+        assumption_id = scoped_spec_assumption_id(spec)
         site = frozenset({(assumption_id, call.loc.line, call.loc.col)})
         if spec.returns == "clean":
             return frozenset(
@@ -1679,26 +1865,41 @@ def revise_specs(snapshot, new_specs=None, disabled_assumptions=(), spec_alterna
     )
     changes = tuple(compare_external_specs(snapshot.specs, new_specs))
     changed_names = {
-        change.name for change in changes if change.status != "unchanged"
+        change.name
+        for change in changes
+        if change.status != "unchanged"
+        and change.old_scope.startswith("global")
+        and change.new_scope.startswith("global")
     }
     changed_ids = {
         assumption
         for change in changes
         for assumption in change.invalidated_assumptions
     }
+    changed_scopes = {
+        (
+            change.name,
+            change.old_scope if change.status == "withdrawn" else change.new_scope,
+        )
+        for change in changes
+        if change.status != "unchanged"
+    }
     # 候选假设（spec_alternatives）的新增/撤回同样令相关结论失效。
     old_alt_ids = {
-        spec_assumption_id(a.name, a.version) for a in snapshot.alternatives
+        scoped_spec_assumption_id(a) for a in snapshot.alternatives
     }
     new_alt_ids = {
-        spec_assumption_id(a.name, a.version) for a in spec_alternatives
+        scoped_spec_assumption_id(a) for a in spec_alternatives
     }
     changed_ids |= old_alt_ids ^ new_alt_ids
     changed_names |= {
         a.name
         for a in tuple(snapshot.alternatives) + tuple(spec_alternatives)
-        if spec_assumption_id(a.name, a.version) in (old_alt_ids ^ new_alt_ids)
+        if scoped_spec_assumption_id(a) in (old_alt_ids ^ new_alt_ids)
     }
+    for spec in tuple(snapshot.alternatives) + tuple(spec_alternatives):
+        if scoped_spec_assumption_id(spec) in (old_alt_ids ^ new_alt_ids):
+            changed_scopes.add((spec.name, spec.scope.label))
 
     def uses_changed_spec(explanation):
         assumption_values = {
@@ -1712,8 +1913,15 @@ def revise_specs(snapshot, new_specs=None, disabled_assumptions=(), spec_alterna
             if set(item.assumptions) & changed_ids:
                 return True
             for hop in item.path.hops:
-                if hop.kind in ("external", "unknown") and any(
-                    f" {name}()" in hop.text for name in changed_names
+                if hop.kind not in ("external", "unknown"):
+                    continue
+                if any(f" {name}()" in hop.text for name in changed_names):
+                    return True
+                call_label = f"call::{hop.loc.line}:{hop.loc.col}"
+                if any(
+                    f" {name}()" in hop.text and label == call_label
+                    for name, label in changed_scopes
+                    if label.startswith("call:")
                 ):
                     return True
         return False
