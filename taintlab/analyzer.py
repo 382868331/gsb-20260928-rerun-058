@@ -51,6 +51,7 @@ from .model import (
     AssumptionConflict,
     Scenario,
 )
+from .model import NamedScenario, NamedScenarioResult, ScenarioSinkConclusion
 from .parser import parse
 
 # 内置函数建模：整个分析过程不执行任何被分析代码。
@@ -388,6 +389,409 @@ def snapshot_analysis(source, config=None):
         config.spec_alternatives,
     )
     return result, snapshot
+
+
+@dataclass(frozen=True)
+class ScenarioStudy:
+    """把若干外部行为说明组成有名称的联合情景所做的比较研究。
+
+    研究者在 ``scenarios`` 中给出需共同成立的说明版本组合；评估后每个
+    情景独立给出可行性、导致不可行的最小冲突依据以及逐 sink 的情景化
+    结论。同一外部返回值在不同情景下分别标注，某情景下的无风险结论
+    不会扩展到其它备选；未知外部返回（``undecidable``）与没有任何
+    可行风险情景（整体 ``INCOMPLETE``）是两种不同状态。
+
+    ``base_result`` 是在全部启用说明 + 候选说明上做的一次基础分析，
+    各情景只是对其逐路径依据做“投影”：只有路径所需说明全部包含在
+    情景中的依据才在该情景成立，从而保证风险路径注明情景与版本。
+    """
+
+    source: str
+    scenarios: tuple[NamedScenario, ...]
+    base_config: AnalysisConfig
+    base_result: "object"
+    results: tuple[NamedScenarioResult, ...]
+    created_at: str
+
+    @property
+    def verdict(self) -> str:
+        """跨情景总判：保留仍然可行的其它情景，区分未知与无可行情景。"""
+
+        feasible = [item for item in self.results if item.feasible]
+        if not feasible:
+            # 没有任何可行联合情景：与“未知外部返回”不同，不能归成安全。
+            return "INCOMPLETE"
+        verdicts = {item.verdict for item in feasible}
+        for value in ("UNSAFE", "INCOMPLETE", "ASSUMED"):
+            if value in verdicts:
+                return value
+        return "SAFE"
+
+    def by_name(self, name: str) -> NamedScenarioResult | None:
+        for item in self.results:
+            if item.scenario.name == name:
+                return item
+        return None
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "source": self.source,
+                "created_at": self.created_at,
+                "scenarios": [asdict(scenario) for scenario in self.scenarios],
+                "results": [_encode_study_result(item) for item in self.results],
+                "base_config": {
+                    "external_specs": {
+                        name: asdict(spec)
+                        for name, spec in (self.base_config.external_specs or {}).items()
+                    },
+                    "disabled_assumptions": sorted(
+                        self.base_config.disabled_assumptions
+                    ),
+                    "spec_alternatives": [
+                        asdict(spec) for spec in self.base_config.spec_alternatives
+                    ],
+                },
+            },
+            ensure_ascii=False,
+            default=_json_default,
+            indent=2,
+        )
+
+    def save(self, path) -> None:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(self.to_json())
+
+    @classmethod
+    def from_dict(cls, data) -> "ScenarioStudy":
+        scenarios = tuple(
+            NamedScenario(
+                name=item["name"],
+                description=item["description"],
+                assumptions=tuple(item["assumptions"]),
+            )
+            for item in data["scenarios"]
+        )
+        results = tuple(
+            _decode_study_result(item) for item in data["results"]
+        )
+        config_data = data.get("base_config", {})
+        config = AnalysisConfig(
+            external_specs={
+                name: ExternalSpec(**spec)
+                for name, spec in config_data.get("external_specs", {}).items()
+            },
+            disabled_assumptions=frozenset(
+                config_data.get("disabled_assumptions", ())
+            ),
+            spec_alternatives=tuple(
+                ExternalSpec(**spec)
+                for spec in config_data.get("spec_alternatives", ())
+            ),
+        )
+        study = cls(
+            source=data["source"],
+            scenarios=scenarios,
+            base_config=config,
+            base_result=analyze_source(data["source"], config),
+            results=results,
+            created_at=data["created_at"],
+        )
+        return study
+
+    @classmethod
+    def load(cls, path) -> "ScenarioStudy":
+        with open(path, "r", encoding="utf-8") as handle:
+            return cls.from_dict(json.load(handle))
+
+
+def study_scenarios(source, scenarios, config=None) -> ScenarioStudy:
+    """把若干有名称的联合情景放在同一基础分析上做比较研究。
+
+    两个输出点共享同一份外部返回分析（``base_result``），但按各自情景
+    对依据做投影，风险与矛盾不会互相掩盖。
+    """
+
+    config = config or AnalysisConfig()
+    base_result = analyze_source(source, config)
+    results = tuple(
+        _evaluate_named_scenario(scenario, base_result) for scenario in scenarios
+    )
+    return ScenarioStudy(
+        source=source,
+        scenarios=tuple(scenarios),
+        base_config=config,
+        base_result=base_result,
+        results=results,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def _path_under_scenario(item: PathExplanation, chosen: frozenset[str]) -> bool:
+    """一条依据是否在所选情景内成立：其全部假设都被情景包含。"""
+
+    return frozenset(item.assumptions) <= chosen
+
+
+def _evaluate_named_scenario(
+    scenario: NamedScenario, base_result
+) -> NamedScenarioResult:
+    chosen = frozenset(scenario.assumptions)
+
+    # 最小冲突依据：只保留两个互斥假设都被本情景共同采用、且作用于
+    # 同一次调用实例的冲突。多组独立冲突各自独立列出。
+    conflicts: list[AssumptionConflict] = []
+    for conflict in base_result.conflicts:
+        first, second = conflict.assumptions
+        line, col = conflict.loc.line, conflict.loc.col
+        if first in chosen and second in chosen:
+            conflicts.append(conflict)
+
+    if conflicts:
+        # 不可行情景不给出逐 sink 安全/风险结论；最小冲突即其依据。
+        return NamedScenarioResult(
+            scenario=scenario,
+            feasible=False,
+            minimal_conflicts=tuple(conflicts),
+            verdict="INFEASIBLE",
+        )
+
+    sink_conclusions: list[ScenarioSinkConclusion] = []
+    verdict_has_confirmed = False
+    verdict_has_unknown = False
+    verdict_has_assumed = False
+    for explanation in base_result.explanations:
+        risk_items = [
+            item
+            for item in explanation.path_explanations
+            if item.kind == "risk" and _path_under_scenario(item, chosen)
+        ]
+        safe_items = [
+            item
+            for item in explanation.path_explanations
+            if item.kind == "safe" and _path_under_scenario(item, chosen)
+        ]
+
+        confirmed = [
+            i for i in risk_items if i.evidence == Evidence.CONFIRMED
+        ]
+        assumed = [i for i in risk_items if i.evidence == Evidence.ASSUMED]
+        unknown = [i for i in risk_items if i.evidence == Evidence.UNKNOWN]
+
+        if confirmed:
+            state = "confirmed_risk"
+            verdict_has_confirmed = True
+        elif assumed:
+            state = "conditional_risk"
+            verdict_has_assumed = True
+        elif unknown:
+            state = "undecidable"
+            verdict_has_unknown = True
+        else:
+            state = "no_risk"
+
+        def tagged(item: PathExplanation) -> PathExplanation:
+            return replace(item, scenario=scenario.name)
+
+        required = tuple(
+            sorted(
+                {
+                    assumption
+                    for item in risk_items + safe_items
+                    for assumption in item.assumptions
+                }
+            )
+        )
+        sink_conclusions.append(
+            ScenarioSinkConclusion(
+                sink_id=explanation.conclusion_id,
+                sink=explanation.sink,
+                loc=explanation.loc,
+                state=state,
+                risk_explanations=tuple(tagged(i) for i in risk_items),
+                safe_explanations=tuple(tagged(i) for i in safe_items),
+                required_assumptions=required,
+            )
+        )
+
+    if verdict_has_confirmed:
+        verdict = "UNSAFE"
+    elif verdict_has_unknown:
+        verdict = "INCOMPLETE"
+    elif verdict_has_assumed:
+        verdict = "ASSUMED"
+    else:
+        verdict = "SAFE"
+    return NamedScenarioResult(
+        scenario=scenario,
+        feasible=True,
+        sink_conclusions=tuple(sink_conclusions),
+        verdict=verdict,
+    )
+
+
+def _encode_study_result(result: NamedScenarioResult) -> dict:
+    return {
+        "scenario": asdict(result.scenario),
+        "feasible": result.feasible,
+        "verdict": result.verdict,
+        "minimal_conflicts": [asdict(item) for item in result.minimal_conflicts],
+        "sink_conclusions": [
+            {
+                "sink_id": item.sink_id,
+                "sink": item.sink,
+                "loc": asdict(item.loc),
+                "state": item.state,
+                "required_assumptions": item.required_assumptions,
+                "risk_explanations": [
+                    asdict(
+                        _encode_path_explanation(part),
+                    )
+                    for part in item.risk_explanations
+                ],
+                "safe_explanations": [
+                    asdict(_encode_path_explanation(part))
+                    for part in item.safe_explanations
+                ],
+            }
+            for item in result.sink_conclusions
+        ],
+    }
+
+
+def _encode_path_explanation(item: PathExplanation) -> PathExplanation:
+    # PathExplanation 本身直接 asdict：Loc/PathHop 是 dataclass，
+    # Evidence 枚举在 json.dumps 时由 _json_default 处理。
+    return item
+
+
+def _decode_study_result(data) -> NamedScenarioResult:
+    scenario = NamedScenario(
+        name=data["scenario"]["name"],
+        description=data["scenario"]["description"],
+        assumptions=tuple(data["scenario"]["assumptions"]),
+    )
+    conflicts = tuple(
+        _decode_conflict(item) for item in data.get("minimal_conflicts", ())
+    )
+    conclusions = tuple(
+        ScenarioSinkConclusion(
+            sink_id=item["sink_id"],
+            sink=item["sink"],
+            loc=_decode_loc(item["loc"]),
+            state=item["state"],
+            risk_explanations=tuple(
+                _decode_path_explanation(part)
+                for part in item.get("risk_explanations", ())
+            ),
+            safe_explanations=tuple(
+                _decode_path_explanation(part)
+                for part in item.get("safe_explanations", ())
+            ),
+            required_assumptions=tuple(item.get("required_assumptions", ())),
+        )
+        for item in data.get("sink_conclusions", ())
+    )
+    return NamedScenarioResult(
+        scenario=scenario,
+        feasible=data["feasible"],
+        minimal_conflicts=conflicts,
+        sink_conclusions=conclusions,
+        verdict=data["verdict"],
+    )
+
+
+def _decode_path_explanation(data) -> PathExplanation:
+    return PathExplanation(
+        path=_decode_path(data["path"]),
+        evidence=Evidence(data["evidence"]),
+        assumptions=tuple(data["assumptions"]),
+        kind=data["kind"],
+        assumption_sites=tuple(
+            tuple(site) for site in data.get("assumption_sites", ())
+        ),
+        scenario=data.get("scenario"),
+    )
+
+
+def format_study_text(study: ScenarioStudy) -> str:
+    """把命名联合情景研究渲染为可比较的文本结论。"""
+
+    lines = [f"情景研究总判: {study.verdict}"]
+    for result in study.results:
+        scenario = result.scenario
+        header = (
+            f"情景 {scenario.name} [{result.verdict}]: {scenario.description}"
+        )
+        lines.append(header)
+        lines.append(
+            "    联合说明: " + (", ".join(scenario.assumptions) or "（无）")
+        )
+        if not result.feasible:
+            lines.append("    情景不可行，最小冲突依据:")
+            for conflict in result.minimal_conflicts:
+                lines.append(
+                    f"        CONFLICT {conflict.conflict_id}: "
+                    f"{conflict.assumptions[0]} 与 {conflict.assumptions[1]} "
+                    f"在 {conflict.name}() {conflict.loc} 上互斥"
+                )
+            continue
+        for conclusion in result.sink_conclusions:
+            lines.append(
+                f"    {conclusion.sink_id}: {conclusion.state}"
+            )
+            for item in conclusion.risk_explanations:
+                version = ", ".join(item.assumptions) or "语言内置语义"
+                lines.append(
+                    f"        风险依据 [情景={item.scenario}; 说明={version}] "
+                    f"证据={item.evidence.value}"
+                )
+    return "\n".join(lines)
+
+
+def revise_study(
+    study: ScenarioStudy,
+    new_specs=None,
+    scenarios=None,
+    disabled_assumptions=(),
+    spec_alternatives=None,
+) -> tuple[object, "ScenarioStudy"]:
+    """修改说明后派生新的比较研究，旧研究（旧查询）保持原依据。
+
+    复用 ``revise_specs`` 对基础快照做增量修订，再在新的基础分析上按
+    命名情景重新投影；未显式给出的候选说明沿用旧研究，旧研究对象不被
+    修改，可单独回看。
+    """
+
+    _, old_snapshot = snapshot_analysis(study.source, study.base_config)
+    if spec_alternatives is None:
+        spec_alternatives = study.base_config.spec_alternatives
+    new_result, _, _ = revise_specs(
+        old_snapshot,
+        new_specs if new_specs is not None else study.base_config.external_specs,
+        disabled_assumptions=disabled_assumptions,
+        spec_alternatives=spec_alternatives,
+    )
+    new_config = AnalysisConfig(
+        external_specs=_spec_dict(
+            new_specs if new_specs is not None else study.base_config.external_specs
+        ),
+        disabled_assumptions=frozenset(disabled_assumptions),
+        spec_alternatives=tuple(spec_alternatives),
+    )
+    chosen_scenarios = scenarios if scenarios is not None else study.scenarios
+    new_study = ScenarioStudy(
+        source=study.source,
+        scenarios=tuple(chosen_scenarios),
+        base_config=new_config,
+        base_result=new_result,
+        results=tuple(
+            _evaluate_named_scenario(scenario, new_result)
+            for scenario in chosen_scenarios
+        ),
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    return new_result, new_study
 
 
 # 变量环境：变量名 -> 该变量当前携带的污点事实集合（空集合 = 干净）。

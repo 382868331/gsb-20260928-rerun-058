@@ -67,6 +67,9 @@ class PathExplanation:
     assumptions: tuple[str, ...] = ()
     kind: str = "risk"  # risk | safe | unknown
     assumption_sites: tuple[tuple[str, int, int], ...] = ()
+    # 该风险依据所在的命名情景名称（仅命名情景研究填写，
+    # 自动情景分析保持为空）；同一返回值在不同情景下分别标注。
+    scenario: str | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +109,57 @@ class Scenario:
     assumptions: tuple[str, ...]
     state: str  # contradictory | risk | no_risk | undecidable
     conflicts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class NamedScenario:
+    """有名称的联合情景：研究者显式命名、需共同采用的一组说明版本。
+
+    ``assumptions`` 中的每条说明（``名称@版本``）都必须同时成立；
+    未列入的候选说明在该情景中不被采用。情景可行性由其内部是否包含
+    对同一次调用给出互斥结果的最小冲突依据决定。
+    """
+
+    name: str
+    description: str
+    assumptions: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ScenarioSinkConclusion:
+    """某个命名情景下、某个 sink 位置的结论及其依据版本。
+
+    ``state`` 取值：
+    ``confirmed_risk``（已证实风险，与说明无关）/
+    ``conditional_risk``（依赖本情景说明版本的风险）/
+    ``undecidable``（本情景下仍含未知外部返回值）/
+    ``no_risk``（本情景下未发现风险）。
+    风险路径必须注明情景名称与其依赖的说明版本，故风险依据的
+    ``PathExplanation.scenario`` 被填写为该情景名称。
+    """
+
+    sink_id: str
+    sink: str
+    loc: Loc
+    state: str
+    risk_explanations: tuple[PathExplanation, ...] = ()
+    safe_explanations: tuple[PathExplanation, ...] = ()
+    required_assumptions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class NamedScenarioResult:
+    """一个命名联合情景评估后的完整结果。"""
+
+    scenario: NamedScenario
+    feasible: bool
+    # 不可行时，导致该情景不成立的最小冲突依据（逐个独立冲突）；
+    # 撤销其中一条说明只解除涉及它的冲突，其余冲突保留。
+    minimal_conflicts: tuple[AssumptionConflict, ...] = ()
+    # 仅在可行时给出逐 sink 的情景化结论。
+    sink_conclusions: tuple[ScenarioSinkConclusion, ...] = ()
+    # 情景总判：UNSAFE / ASSUMED / INCOMPLETE / SAFE / INFEASIBLE。
+    verdict: str = "INFEASIBLE"
 
 
 class Verdict(str, Enum):

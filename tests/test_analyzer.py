@@ -15,6 +15,9 @@ from taintlab import (
     parse,
     revise_specs,
     snapshot_analysis,
+    study_scenarios,
+    revise_study,
+    NamedScenario,
 )
 from taintlab.callgraph import build_call_graph
 
@@ -699,6 +702,286 @@ class TaintAnalysisTests(unittest.TestCase):
                 tuple(item.conclusion_id for item in loaded.explanations),
                 tuple(item.conclusion_id for item in snapshot.explanations),
             )
+
+
+class NamedScenarioStudyTests(unittest.TestCase):
+    """命名联合情景：共享外部返回、冲突清洗说明与局部撤销的构造案例。
+
+    两个输出点 exec(u)/eval_sql(u) 共享同一次外部返回 relay(x)，
+    另有一个完全没有说明的外部调用 mystery()，用于区分“未知外部返回”
+    与“没有可行情景”两种状态。
+    """
+
+    SOURCE = (
+        "def main(){"
+        " x = read_input();"
+        " u = relay(x);"
+        " m = mystery();"
+        " exec(u);"
+        " eval_sql(u);"
+        " exec(m);"
+        "}"
+    )
+
+    def config(self, disabled=()):
+        return AnalysisConfig(
+            external_specs={
+                "relay": ExternalSpec(
+                    "relay", "旧版本：转发并保留污点",
+                    returns="propagate", version="v1",
+                )
+            },
+            spec_alternatives=(
+                ExternalSpec(
+                    "relay", "新版本：内部净化，返回干净值",
+                    returns="clean", version="v2",
+                ),
+            ),
+            disabled_assumptions=frozenset(disabled),
+        )
+
+    def scenarios(self):
+        return (
+            NamedScenario(
+                "old-relay",
+                "沿用转发语义 v1",
+                ("relay@v1",),
+            ),
+            NamedScenario(
+                "new-relay",
+                "采用净化语义 v2",
+                ("relay@v2",),
+            ),
+            NamedScenario(
+                "both-relay",
+                "同时采用两版互斥说明（构造的不可行情景）",
+                ("relay@v1", "relay@v2"),
+            ),
+        )
+
+    def test_shared_return_risk_is_scoped_to_scenario_and_version(self):
+        study = study_scenarios(self.SOURCE, self.scenarios(), self.config())
+
+        old = study.by_name("old-relay")
+        new = study.by_name("new-relay")
+        self.assertTrue(old.feasible and new.feasible)
+
+        # 旧版本下两个共享同一返回值的输出点都是条件风险，路径必须注明
+        # 情景名称与说明版本，结论不得扩展到其它备选。
+        old_states = {c.sink_id: c.state for c in old.sink_conclusions}
+        self.assertEqual(old_states["exec:1:60"], "conditional_risk")
+        self.assertEqual(old_states["eval_sql:1:69"], "conditional_risk")
+        for sink_id in ("exec:1:60", "eval_sql:1:69"):
+            conclusion = next(
+                c for c in old.sink_conclusions if c.sink_id == sink_id
+            )
+            self.assertTrue(conclusion.risk_explanations)
+            for item in conclusion.risk_explanations:
+                self.assertEqual(item.scenario, "old-relay")
+                self.assertEqual(item.assumptions, ("relay@v1",))
+
+        # 新版本（清洗）下同样两个输出点无风险；该无风险结论只属于
+        # new-relay 情景，不会扩展到旧版本。
+        new_states = {c.sink_id: c.state for c in new.sink_conclusions}
+        self.assertEqual(new_states["exec:1:60"], "no_risk")
+        self.assertEqual(new_states["eval_sql:1:69"], "no_risk")
+
+    def test_contradictory_scenario_has_minimal_conflict_and_others_survive(self):
+        study = study_scenarios(self.SOURCE, self.scenarios(), self.config())
+        both = study.by_name("both-relay")
+
+        # 不可行情景给出最小冲突依据（relay 那一次调用上的 v1|v2 互斥）。
+        self.assertFalse(both.feasible)
+        self.assertEqual(len(both.minimal_conflicts), 1)
+        conflict = both.minimal_conflicts[0]
+        self.assertEqual(conflict.name, "relay")
+        self.assertEqual(set(conflict.assumptions), {"relay@v1", "relay@v2"})
+        # 不可行情景不产生 sink 结论；其它情景仍然保留、可行。
+        self.assertEqual(both.sink_conclusions, ())
+        self.assertEqual(
+            {item.scenario.name for item in study.results if item.feasible},
+            {"old-relay", "new-relay"},
+        )
+
+    def test_no_feasible_scenario_is_incomplete_not_safe(self):
+        # 唯一的联合情景自相矛盾：没有任何可行备选时研究总判 INCOMPLETE，
+        # 与“存在未知外部返回”区分，也绝不能归成 SAFE。
+        only_contradictory = (
+            NamedScenario(
+                "both-relay", "两版同时采用",
+                ("relay@v1", "relay@v2"),
+            ),
+        )
+        study = study_scenarios(
+            self.SOURCE, only_contradictory, self.config()
+        )
+        self.assertEqual(study.verdict, "INCOMPLETE")
+        self.assertFalse(study.by_name("both-relay").feasible)
+
+    def test_unknown_external_return_is_undecidable_even_when_relay_clean(self):
+        # mystery() 没有任何说明：未知外部返回与“无可行情景”是不同状态，
+        # 即使 relay 取清洗版本，exec(m) 仍无法判定，不能归成安全。
+        study = study_scenarios(self.SOURCE, self.scenarios(), self.config())
+        new = study.by_name("new-relay")
+        mystery = next(
+            c for c in new.sink_conclusions if c.sink_id == "exec:1:82"
+        )
+        self.assertEqual(mystery.state, "undecidable")
+        self.assertIs(new.verdict, "INCOMPLETE")
+
+        # 旧版本既有条件风险又有未知项：风险与未知都不被对方掩盖。
+        old = study.by_name("old-relay")
+        old_states = {c.sink_id: c.state for c in old.sink_conclusions}
+        self.assertEqual(old_states["exec:1:60"], "conditional_risk")
+        self.assertEqual(old_states["exec:1:82"], "undecidable")
+        # 存在未知项时情景总判为 INCOMPLETE，而非 ASSUMED/SAFE。
+        self.assertEqual(old.verdict, "INCOMPLETE")
+
+    def test_partial_retraction_resolves_only_one_of_independent_conflicts(self):
+        # 两个独立调用点各自存在一对冲突；撤销一条说明只解除涉及它的
+        # 那一组冲突，另一组保留，情景由不可行转为部分可行。
+        source = (
+            "def main(){"
+            " x = read_input();"
+            " a = relay(x); b = relay(x);"
+            " exec(a); eval_sql(b);"
+            "}"
+        )
+        scenarios = (
+            NamedScenario("both", "两版同时采用", ("relay@v1", "relay@v2")),
+        )
+        study = study_scenarios(source, scenarios, self.config())
+        self.assertFalse(study.by_name("both").feasible)
+        self.assertEqual(
+            len(study.by_name("both").minimal_conflicts), 2
+        )
+
+        # 局部撤销 v1：两个调用点上的 v1|v2 冲突都涉及 v1，故全部解除。
+        retracted = study_scenarios(
+            source,
+            scenarios,
+            self.config(disabled={"relay@v1"}),
+        )
+        result = retracted.by_name("both")
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.minimal_conflicts, ())
+
+    def test_retracting_one_spec_leaves_independent_conflict_intact(self):
+        # 一个情景内包含两组相互独立的矛盾（lib 与 net 各一对）；
+        # 只撤销 lib@v1 时 lib 的冲突消失，net 的冲突仍在，情景仍不可行。
+        source = (
+            "def main(){"
+            " x = read_input(); y = lib(x); z = net(x);"
+            " exec(y); eval_sql(z);"
+            "}"
+        )
+        config = AnalysisConfig(
+            external_specs={
+                "lib": ExternalSpec("lib", "lib 干净", "clean", version="v1"),
+                "net": ExternalSpec("net", "net 干净", "clean", version="v1"),
+            },
+            spec_alternatives=(
+                ExternalSpec("lib", "lib 不可信", "tainted", version="v2"),
+                ExternalSpec("net", "net 不可信", "tainted", version="v2"),
+            ),
+        )
+        scenario = NamedScenario(
+            "all", "同时采用四个版本",
+            ("lib@v1", "lib@v2", "net@v1", "net@v2"),
+        )
+        study = study_scenarios(source, (scenario,), config)
+        before = study.by_name("all")
+        self.assertFalse(before.feasible)
+        self.assertEqual(
+            sorted(c.name for c in before.minimal_conflicts), ["lib", "net"]
+        )
+
+        # 局部撤销 lib@v1：该说明不再参与，lib 冲突被解除，net 冲突保留。
+        disabled_config = AnalysisConfig(
+            external_specs=config.external_specs,
+            spec_alternatives=config.spec_alternatives,
+            disabled_assumptions={"lib@v1"},
+        )
+        remaining_scenario = NamedScenario(
+            "all-minus-lib-v1",
+            "撤销 lib@v1 后剩余说明",
+            ("lib@v2", "net@v1", "net@v2"),
+        )
+        after = study_scenarios(
+            source, (remaining_scenario,), disabled_config
+        ).by_name("all-minus-lib-v1")
+        self.assertFalse(after.feasible)
+        self.assertEqual(
+            [c.name for c in after.minimal_conflicts], ["net"]
+        )
+        self.assertEqual(
+            set(after.minimal_conflicts[0].assumptions),
+            {"net@v1", "net@v2"},
+        )
+
+    def test_revise_study_keeps_old_query_basis_and_reprojects_new(self):
+        study = study_scenarios(self.SOURCE, self.scenarios(), self.config())
+        # 旧查询保持原依据：旧情景中 relay@v1 是条件风险。
+        self.assertEqual(
+            study.by_name("old-relay").sink_conclusions[0].state,
+            "conditional_risk",
+        )
+
+        # 派生比较研究：把 relay 修订为新的净化版本 v3，候选不再含冲突。
+        new_specs = {
+            "relay": ExternalSpec(
+                "relay", "修订版：净化", returns="clean", version="v3"
+            )
+        }
+        new_scenarios = (
+            NamedScenario("revised-relay", "修订后的净化情景", ("relay@v3",)),
+        )
+        _, revised = revise_study(
+            study,
+            new_specs=new_specs,
+            scenarios=new_scenarios,
+            spec_alternatives=(),
+        )
+        revised_result = revised.by_name("revised-relay")
+        self.assertTrue(revised_result.feasible)
+        revised_states = {
+            c.sink_id: c.state for c in revised_result.sink_conclusions
+        }
+        self.assertEqual(revised_states["exec:1:60"], "no_risk")
+        self.assertEqual(revised_states["eval_sql:1:69"], "no_risk")
+        # 未知返回 mystery() 不随说明修订被补成安全。
+        self.assertEqual(revised_states["exec:1:82"], "undecidable")
+        # 旧研究对象未被修改，仍可单独回看原依据。
+        self.assertEqual(
+            study.by_name("old-relay").sink_conclusions[0].state,
+            "conditional_risk",
+        )
+        self.assertIn("relay@v1", study.by_name("both-relay").scenario.assumptions)
+
+    def test_study_json_roundtrip_preserves_scenario_basis(self):
+        study = study_scenarios(self.SOURCE, self.scenarios(), self.config())
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "study.json"
+            study.save(path)
+            loaded = type(study).load(path)
+            self.assertEqual(
+                [s.name for s in loaded.scenarios],
+                [s.name for s in study.scenarios],
+            )
+            old = loaded.by_name("old-relay")
+            conclusion = next(
+                c for c in old.sink_conclusions if c.sink_id == "exec:1:60"
+            )
+            self.assertEqual(conclusion.state, "conditional_risk")
+            self.assertEqual(
+                conclusion.risk_explanations[0].scenario, "old-relay"
+            )
+            self.assertEqual(
+                conclusion.risk_explanations[0].assumptions, ("relay@v1",)
+            )
+            both = loaded.by_name("both-relay")
+            self.assertFalse(both.feasible)
+            self.assertEqual(len(both.minimal_conflicts), 1)
 
 
 if __name__ == "__main__":

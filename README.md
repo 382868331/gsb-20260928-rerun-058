@@ -78,6 +78,29 @@ def 函数名(参数, ...) { 语句; ... }
   变化归因为 `conflict_driven_conclusions`（冲突解除）与
   `path_driven_conclusions`（程序路径变化）。旧快照中的冲突、情景与结论可
   单独回看，与修订后的结果对照。
+- **有名称的联合情景比较研究**：`study_scenarios(source, scenarios, config)`
+  把若干说明版本显式组成有名称、需共同成立的联合情景
+  （`NamedScenario(name, description, assumptions=("relay@v1", ...))`），
+  研究者据此比较各情景下的安全结论，而不是逐条查看互不相容的备选。所有
+  情景共享同一份基础外部返回分析（`ScenarioStudy.base_result`），再按情景对
+  逐路径依据做投影：只有路径所需说明全部被该情景包含时依据才成立。
+  - 风险注明情景与版本：风险依据写入 `PathExplanation.scenario` 与其
+    `assumptions`（名称@版本）；`ScenarioSinkConclusion` 给出每个 sink 在该
+    情景下的 `confirmed_risk` / `conditional_risk` / `no_risk`，某情景下的
+    无风险结论不会扩展到其它备选。
+  - 最小冲突依据：不可行情景的 `minimal_conflicts` 逐个列出组内独立的
+    互斥冲突（作用于同一次调用实例的两条说明）。一个情景可含多组独立
+    矛盾；用 `disabled_assumptions` 局部撤销一条说明只解除涉及它的冲突，
+    其余冲突保留，其它可行情景不受影响（`NamedScenarioResult.feasible`）。
+  - 未知外部返回不等于无可行情景：情景内仍含无说明的外部返回时该 sink
+    为 `undecidable`、情景总判 `INCOMPLETE`；所有情景都不可行时研究总判
+    也是 `INCOMPLETE`，但二者来自 `ScenarioSinkConclusion.state` 与
+    `ScenarioStudy.verdict` 两个不同层级，都不会被归成安全。
+  - 派生比较研究、旧查询保持原依据：`revise_study(study, new_specs,
+    scenarios=..., disabled_assumptions=..., spec_alternatives=...)` 基于
+    `revise_specs` 派生新研究并重投影，旧 `ScenarioStudy` 对象不被修改；
+    `ScenarioStudy.save()/load()` 可把研究（含情景、最小冲突、逐路径依据）
+    持久化为 JSON；`format_study_text(study)` 输出可比较的文本结论。
 
 三类证据分开诊断：`TAINT-FLOW` / `CONFIRMED`（已证实）、
 `TAINT-ASSUMED` / `ASSUMED`（依赖外部说明）、`TAINT-UNCERTAIN` /

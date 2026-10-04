@@ -15,6 +15,7 @@ from .model import (
     Verdict,
 )
 from .model import AssumptionConflict, Scenario
+from .model import NamedScenario, NamedScenarioResult, ScenarioSinkConclusion
 from .analyzer import (
     analyze_source,
     analyze_program,
@@ -26,6 +27,10 @@ from .analyzer import (
     SpecVersionChange,
     revise_specs,
     snapshot_analysis,
+    study_scenarios,
+    revise_study,
+    ScenarioStudy,
+    format_study_text,
 )
 from .parser import parse
 from .lexer import LexerError
@@ -45,10 +50,17 @@ __all__ = [
     "ResearchSnapshot",
     "RevisionReport",
     "Scenario",
+    "NamedScenario",
+    "NamedScenarioResult",
+    "ScenarioSinkConclusion",
+    "ScenarioStudy",
     "SpecVersionChange",
     "compare_external_specs",
     "revise_specs",
+    "revise_study",
     "snapshot_analysis",
+    "study_scenarios",
+    "format_study_text",
     "Diagnostic",
     "Severity",
     "TaintPath",
