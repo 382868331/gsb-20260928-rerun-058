@@ -6,6 +6,76 @@ from enum import Enum
 from .locations import Loc
 
 
+@dataclass(frozen=True)
+class SpecScope:
+    """外部行为说明的适用范围：限定到某个调用点或一段文件行范围。
+
+    ``None`` 列表示该维度不限定：``SpecScope.at(line, col)`` 限定到
+    单个调用点；``SpecScope.lines(start, end)`` 限定到一段行范围。
+    只有调用位置落在范围内的说明才作用于该次调用；范围外的同名
+    调用不会继承该说明的结论。
+    """
+
+    start_line: int
+    start_col: int | None = None
+    end_line: int | None = None
+    end_col: int | None = None
+
+    @classmethod
+    def at(cls, line: int, col: int) -> "SpecScope":
+        return cls(line, col, line, col)
+
+    @classmethod
+    def lines(cls, start: int, end: int) -> "SpecScope":
+        return cls(start, None, end, None)
+
+    def contains(self, loc: Loc) -> bool:
+        if loc.line < self.start_line:
+            return False
+        end_line = self.end_line if self.end_line is not None else self.start_line
+        if loc.line > end_line:
+            return False
+        if (
+            self.start_col is not None
+            and loc.line == self.start_line
+            and loc.col < self.start_col
+        ):
+            return False
+        if (
+            self.end_col is not None
+            and loc.line == end_line
+            and loc.col > self.end_col
+        ):
+            return False
+        return True
+
+    def intersects(self, other: "SpecScope") -> bool:
+        """两个范围是否存在可能共同覆盖的调用位置。"""
+
+        a_end = self.end_line if self.end_line is not None else self.start_line
+        b_end = other.end_line if other.end_line is not None else other.start_line
+        if self.start_line > b_end or other.start_line > a_end:
+            return False
+        if a_end == b_end == self.start_line == other.start_line:
+            # 同一行内的点范围需要列也相交。
+            a_lo = self.start_col if self.start_col is not None else 0
+            a_hi = self.end_col if self.end_col is not None else 10**9
+            b_lo = other.start_col if other.start_col is not None else 0
+            b_hi = other.end_col if other.end_col is not None else 10**9
+            return a_lo <= b_hi and b_lo <= a_hi
+        return True
+
+    def label(self) -> str:
+        end_line = self.end_line if self.end_line is not None else self.start_line
+        if self.start_col is None and self.end_col is None:
+            if end_line == self.start_line:
+                return f"L{self.start_line}"
+            return f"L{self.start_line}-L{end_line}"
+        start = f"L{self.start_line}:C{self.start_col}"
+        end = f"L{end_line}:C{self.end_col}"
+        return start if start == end else f"{start}-{end}"
+
+
 class Severity(str, Enum):
     ERROR = "error"        # 已确认：不可信数据到达危险操作
     WARNING = "warning"    # 未能排除（递归/深度上限等导致分析不完整）
@@ -56,6 +126,8 @@ class AssumptionRecord:
     description: str
     locations: tuple[Loc, ...] = ()
     paths: tuple[TaintPath, ...] = ()
+    # 该依据的适用范围；None 表示全局说明。
+    scope: "SpecScope | None" = None
 
 
 @dataclass(frozen=True)
@@ -198,6 +270,8 @@ class AnalysisResult:
                 f"ASSUMPTION: {assumption.assumption_id} {assumption.name}{version} "
                 f"returns={assumption.returns}: {assumption.description}"
             )
+            if assumption.scope is not None:
+                lines.append(f"    适用范围: {assumption.scope.label()}")
             for loc in assumption.locations:
                 lines.append(f"    {loc}  使用该说明的外部调用")
             for path in assumption.paths:

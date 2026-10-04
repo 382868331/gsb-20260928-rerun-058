@@ -19,6 +19,7 @@ from taintlab import (
     revise_study,
     NamedScenario,
 )
+from taintlab import SpecScope
 from taintlab.callgraph import build_call_graph
 
 
@@ -982,6 +983,256 @@ class NamedScenarioStudyTests(unittest.TestCase):
             both = loaded.by_name("both-relay")
             self.assertFalse(both.feasible)
             self.assertEqual(len(both.minimal_conflicts), 1)
+
+
+class ScopedSpecTests(unittest.TestCase):
+    SOURCE = (
+        "def main(){\n"
+        " a = lib(1);\n"
+        " exec(a);\n"
+        " b = lib(2);\n"
+        " exec(b);\n"
+        "}\n"
+    )
+    # 两次 lib() 调用分别在第 2 行第 6 列与第 4 行第 6 列。
+    SITE_A = SpecScope.at(2, 6)
+    SITE_B = SpecScope.at(4, 6)
+
+    def test_scoped_spec_does_not_leak_to_unknown_neighbor(self):
+        # 只有第一个调用点有净化说明；第二个同名未知调用不得继承
+        # 邻近调用的净化结论，仍按未知外部调用处理。
+        config = AnalysisConfig(
+            scoped_specs=(
+                ExternalSpec(
+                    "lib", "仅第一个调用点返回干净值", "clean",
+                    version="v1", scope=self.SITE_A,
+                ),
+            )
+        )
+        result = analyze_source(self.SOURCE, config)
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+        uncertain = [
+            d for d in result.diagnostics if d.rule == "TAINT-UNCERTAIN"
+        ]
+        self.assertEqual(len(uncertain), 1)
+        self.assertEqual(uncertain[0].loc.line, 5)
+        # 第一个 sink 无风险诊断，其结论依赖带范围的假设 ID。
+        self.assertFalse(
+            any(d.loc.line == 3 for d in result.diagnostics)
+        )
+        self.assertIn("lib@v1#L2:C6", result.assumptions[0].assumption_id)
+
+    def test_same_library_uses_different_versions_at_different_sites(self):
+        config = AnalysisConfig(
+            scoped_specs=(
+                ExternalSpec(
+                    "lib", "v1 不可信", "tainted",
+                    version="v1", scope=self.SITE_A,
+                ),
+                ExternalSpec(
+                    "lib", "v2 干净", "clean",
+                    version="v2", scope=self.SITE_B,
+                ),
+            )
+        )
+        result = analyze_source(self.SOURCE, config)
+        self.assertIs(result.verdict, Verdict.ASSUMED)
+        assumed = [
+            d for d in result.diagnostics if d.rule == "TAINT-ASSUMED"
+        ]
+        self.assertEqual(len(assumed), 1)
+        self.assertEqual(assumed[0].loc.line, 3)
+        self.assertEqual(assumed[0].assumptions, ("lib@v1#L2:C6",))
+        # 每个输出风险可追溯到版本与适用范围。
+        records = {a.assumption_id: a for a in result.assumptions}
+        self.assertEqual(records["lib@v1#L2:C6"].version, "v1")
+        self.assertEqual(records["lib@v1#L2:C6"].scope, self.SITE_A)
+        self.assertEqual(records["lib@v2#L4:C6"].scope, self.SITE_B)
+
+    def test_scoped_spec_overrides_global_only_within_scope(self):
+        config = AnalysisConfig(
+            external_specs={
+                "lib": ExternalSpec("lib", "全局干净", "clean", version="v1")
+            },
+            scoped_specs=(
+                ExternalSpec(
+                    "lib", "局部不可信", "tainted",
+                    version="v2", scope=self.SITE_A,
+                ),
+            ),
+        )
+        result = analyze_source(self.SOURCE, config)
+        assumed = [
+            d for d in result.diagnostics if d.rule == "TAINT-ASSUMED"
+        ]
+        # 第一个调用点被局部覆盖（不可信），第二个调用点仍用全局说明。
+        self.assertEqual(len(assumed), 1)
+        self.assertEqual(assumed[0].loc.line, 3)
+        self.assertEqual(assumed[0].assumptions, ("lib@v2#L2:C6",))
+        ids = {a.assumption_id for a in result.assumptions}
+        self.assertIn("lib@v1", ids)
+        self.assertIn("lib@v2#L2:C6", ids)
+
+    def test_joint_scenario_conflicts_only_in_intersecting_scopes(self):
+        disjoint = AnalysisConfig(
+            scoped_specs=(
+                ExternalSpec(
+                    "lib", "v1 干净", "clean",
+                    version="v1", scope=self.SITE_A,
+                ),
+                ExternalSpec(
+                    "lib", "v2 不可信", "tainted",
+                    version="v2", scope=self.SITE_B,
+                ),
+            )
+        )
+        scenarios = (
+            NamedScenario(
+                "joint",
+                "两个不相交范围的说明联合",
+                ("lib@v1#L2:C6", "lib@v2#L4:C6"),
+            ),
+        )
+        study = study_scenarios(self.SOURCE, scenarios, disjoint)
+        joint = study.by_name("joint")
+        # 范围不相交：互斥条件不成立，情景可行。
+        self.assertTrue(joint.feasible)
+        self.assertEqual(joint.minimal_conflicts, ())
+
+        overlapping = AnalysisConfig(
+            scoped_specs=(
+                ExternalSpec(
+                    "lib", "v1 干净", "clean",
+                    version="v1", scope=self.SITE_A,
+                ),
+                ExternalSpec(
+                    "lib", "v2 不可信", "tainted",
+                    version="v2", scope=self.SITE_A,
+                ),
+            )
+        )
+        scenarios2 = (
+            NamedScenario(
+                "clash",
+                "同一调用点上两版互斥说明",
+                ("lib@v1#L2:C6", "lib@v2#L2:C6"),
+            ),
+        )
+        study2 = study_scenarios(self.SOURCE, scenarios2, overlapping)
+        clash = study2.by_name("clash")
+        self.assertFalse(clash.feasible)
+        self.assertEqual(len(clash.minimal_conflicts), 1)
+        self.assertEqual(
+            set(clash.minimal_conflicts[0].assumptions),
+            {"lib@v1#L2:C6", "lib@v2#L2:C6"},
+        )
+
+    def test_local_withdrawal_keeps_other_sites_basis(self):
+        scoped = (
+            ExternalSpec(
+                "lib", "v1 不可信", "tainted",
+                version="v1", scope=self.SITE_A,
+            ),
+            ExternalSpec(
+                "lib", "v2 不可信", "tainted",
+                version="v2", scope=self.SITE_B,
+            ),
+        )
+        config = AnalysisConfig(
+            scoped_specs=scoped,
+            disabled_assumptions={"lib@v1#L2:C6"},
+        )
+        result = analyze_source(self.SOURCE, config)
+        # 局部撤回只影响第一个调用点（回到未知），第二个调用点的
+        # 依据仍然保留。
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+        uncertain = [
+            d for d in result.diagnostics if d.rule == "TAINT-UNCERTAIN"
+        ]
+        assumed = [
+            d for d in result.diagnostics if d.rule == "TAINT-ASSUMED"
+        ]
+        self.assertEqual([d.loc.line for d in uncertain], [3])
+        self.assertEqual([d.loc.line for d in assumed], [5])
+        self.assertEqual(assumed[0].assumptions, ("lib@v2#L4:C6",))
+
+    def test_file_range_scope_covers_multiple_sites(self):
+        config = AnalysisConfig(
+            scoped_specs=(
+                ExternalSpec(
+                    "lib", "第 2-4 行范围内不可信", "tainted",
+                    version="v9", scope=SpecScope.lines(2, 4),
+                ),
+            )
+        )
+        result = analyze_source(self.SOURCE, config)
+        assumed = [
+            d for d in result.diagnostics if d.rule == "TAINT-ASSUMED"
+        ]
+        self.assertEqual([d.loc.line for d in assumed], [3, 5])
+        for d in assumed:
+            self.assertEqual(d.assumptions, ("lib@v9#L2-L4",))
+
+    def test_snapshot_roundtrip_compares_global_and_scoped(self):
+        scoped = (
+            ExternalSpec(
+                "lib", "局部干净", "clean",
+                version="v1", scope=self.SITE_A,
+            ),
+        )
+        config = AnalysisConfig(
+            external_specs={
+                "net": ExternalSpec("net", "全局说明", "propagate", version="1")
+            },
+            scoped_specs=scoped,
+        )
+        _, snapshot = snapshot_analysis(self.SOURCE, config)
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "snap.json"
+            snapshot.save(path)
+            loaded = type(snapshot).load(path)
+        # 重载后全局说明与局部覆盖仍然都在，且可分别比较。
+        self.assertEqual(loaded.scoped_specs, scoped)
+        self.assertEqual(loaded.specs, snapshot.specs)
+        changes = compare_external_specs(
+            snapshot.specs,
+            {"net": ExternalSpec("net", "全局说明", "tainted", version="2")},
+            loaded.scoped_specs,
+            (
+                ExternalSpec(
+                    "lib", "局部干净", "clean",
+                    version="v2", scope=self.SITE_A,
+                ),
+            ),
+        )
+        by_name = {(c.name, c.status) for c in changes}
+        self.assertIn(("net", "changed"), by_name)
+        self.assertIn(("lib", "withdrawn"), by_name)
+        self.assertIn(("lib", "added"), by_name)
+        scoped_change = next(
+            c for c in changes if c.name == "lib" and c.status == "withdrawn"
+        )
+        self.assertEqual(scoped_change.scope, self.SITE_A)
+        self.assertEqual(
+            scoped_change.invalidated_assumptions, ("lib@v1#L2:C6",)
+        )
+
+    def test_revise_specs_with_scoped_change_marks_affected(self):
+        scoped = (
+            ExternalSpec(
+                "lib", "局部不可信", "tainted",
+                version="v1", scope=self.SITE_A,
+            ),
+        )
+        _, snapshot = snapshot_analysis(
+            self.SOURCE, AnalysisConfig(scoped_specs=scoped)
+        )
+        _, report, _ = revise_specs(snapshot, {}, scoped_specs=())
+        # 撤回局部说明后，依赖它的结论位置被标记为受影响。
+        self.assertIn("exec:3:2", report.affected_conclusions)
+        withdrawn = [c for c in report.changes if c.status == "withdrawn"]
+        self.assertEqual(len(withdrawn), 1)
+        self.assertEqual(withdrawn[0].scope, self.SITE_A)
 
 
 if __name__ == "__main__":

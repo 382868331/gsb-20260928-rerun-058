@@ -49,6 +49,18 @@ def 函数名(参数, ...) { 语句; ... }
   表示：`(A) 或 (B)` 中 A、B 都不是不可或缺；只有所有替代路径共同需要、且
   删除后该路径无法成立的假设才进入 `indispensable_assumptions`。安全常量、
   语言内净化路径以 `kind="safe"` 独立保存；与未知/风险分支合流时不会相互吞没。
+- **限定范围的外部说明版本**：`AnalysisConfig(scoped_specs=...)` 可把外部
+  说明版本限定到某个调用点（`SpecScope.at(行, 列)`）或一段文件行范围
+  （`SpecScope.lines(起, 止)`）。相同库在不同位置可采用不同版本依据；
+  局部覆盖说明在命中范围内取代同名全局说明，范围外的同名调用不受影响。
+  带范围说明的假设 ID 形如 `lib@v1#L2:C6`，每个输出风险都能追溯到版本
+  与适用范围（`AssumptionRecord.scope`）。联合情景只在范围实际相交的
+  调用实例上检查互斥条件；用 `disabled_assumptions` 撤回某个带范围假设
+  只影响该范围内的调用点，不删除其他调用点的依据。范围外的未知调用
+  不会继承邻近调用的净化结论，仍按未知外部调用处理。快照保存重载后，
+  全局说明与局部覆盖说明仍可分别比较（`compare_external_specs(old, new,`
+  `old_scoped, new_scoped)`），`revise_specs`/`revise_study` 接受
+  `scoped_specs=` 参数做增量修订。
 - **相互矛盾的行为假设**：`AnalysisConfig(spec_alternatives=...)` 可登记同一
   外部函数的额外候选说明（如不同版本）。两条候选对**同一次调用**给出互斥
   结果（干净值 vs 不可信值）时记为 `AssumptionConflict`：冲突 ID 含函数名与

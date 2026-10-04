@@ -16,6 +16,7 @@ from .model import (
 )
 from .model import AssumptionConflict, Scenario
 from .model import NamedScenario, NamedScenarioResult, ScenarioSinkConclusion
+from .model import SpecScope
 from .analyzer import (
     analyze_source,
     analyze_program,
@@ -54,6 +55,7 @@ __all__ = [
     "NamedScenarioResult",
     "ScenarioSinkConclusion",
     "ScenarioStudy",
+    "SpecScope",
     "SpecVersionChange",
     "compare_external_specs",
     "revise_specs",
