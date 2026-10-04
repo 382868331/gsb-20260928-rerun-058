@@ -108,6 +108,26 @@ class Scenario:
     conflicts: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class JointScenario:
+    """研究者命名的联合情景：一组同时采纳的说明假设（含版本）。
+
+    情景内部若含有对同一次调用互斥的假设，则该情景不可行；
+    minimal_conflicts 给出导致不可行的最小冲突依据（成对的互斥假设，
+    去掉其中任意一条该组矛盾即消失）。未知外部返回导致的无法判断结论
+    与“无可行情景”是不同状态，分别记录，互不归类。
+    """
+
+    name: str
+    assumptions: tuple[str, ...]
+    withdrawn: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
+    minimal_conflicts: tuple[tuple[str, ...], ...] = ()
+    feasible: bool = True
+    risk_conclusions: tuple[str, ...] = ()
+    undecidable_conclusions: tuple[str, ...] = ()
+
+
 class Verdict(str, Enum):
     UNSAFE = "UNSAFE"        # 发现污点到达 sink
     ASSUMED = "ASSUMED"      # 风险或安全结论依赖外部行为假设
@@ -125,6 +145,7 @@ class AnalysisResult:
     explanations: tuple[ConclusionExplanation, ...] = ()
     conflicts: tuple[AssumptionConflict, ...] = ()
     scenarios: tuple[Scenario, ...] = ()
+    joint_scenarios: tuple[JointScenario, ...] = ()
 
     def format_text(self) -> str:
         lines = [f"分析结论: {self.verdict.value}"]
@@ -208,4 +229,21 @@ class AnalysisResult:
             )
             for conflict_id in scenario.conflicts:
                 lines.append("    涉及冲突: " + conflict_id)
+        for joint in self.joint_scenarios:
+            state = "feasible" if joint.feasible else "infeasible"
+            lines.append(
+                "JOINT " + joint.name + " [" + state + "]: "
+                + (", ".join(joint.assumptions) or "（无外部假设）")
+            )
+            if joint.withdrawn:
+                lines.append("    已局部撤销: " + ", ".join(joint.withdrawn))
+            for pair in joint.minimal_conflicts:
+                lines.append("    最小冲突依据: " + " 与 ".join(pair) + " 互斥")
+            if joint.risk_conclusions:
+                lines.append("    风险结论: " + ", ".join(joint.risk_conclusions))
+            if joint.undecidable_conclusions:
+                lines.append(
+                    "    无法判断结论（未知外部返回，非无可行情景）: "
+                    + ", ".join(joint.undecidable_conclusions)
+                )
         return "\n".join(lines)

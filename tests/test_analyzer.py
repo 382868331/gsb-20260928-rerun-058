@@ -701,5 +701,148 @@ class TaintAnalysisTests(unittest.TestCase):
             )
 
 
+    def test_joint_scenarios_shared_return_conflicting_specs_partial_retraction(self):
+        # 两个输出点 exec(y)/eval_sql(y) 共享同一次 lib() 外部返回；
+        # 清洗说明 lib@v1（净化）与 lib@v2（不净化）互斥，net 同理；
+        # mystery() 无说明，保持未知外部返回语义。
+        source = (
+            "def main(){ x = read_input(); y = lib(x); z = net(x);"
+            " u = mystery(x); exec(y); eval_sql(y); exec(z); eval_sql(u); }"
+        )
+        specs = {
+            "lib": ExternalSpec(
+                "lib", "lib v1 净化后返回干净值", "clean", version="v1"
+            ),
+            "net": ExternalSpec(
+                "net", "net v1 净化后返回干净值", "clean", version="v1"
+            ),
+        }
+        alts = (
+            ExternalSpec(
+                "lib", "lib v2 不净化，原样返回不可信值", "tainted", version="v2"
+            ),
+            ExternalSpec(
+                "net", "net v2 不净化，原样返回不可信值", "tainted", version="v2"
+            ),
+        )
+        joint_defs = {
+            "全候选联合": ("lib@v1", "lib@v2", "net@v1", "net@v2"),
+            "v1净化系列": ("lib@v1", "net@v1"),
+            "v2不净化系列": ("lib@v2", "net@v2"),
+        }
+        config = AnalysisConfig(
+            external_specs=specs,
+            spec_alternatives=alts,
+            joint_scenarios=joint_defs,
+        )
+        result = analyze_source(source, config)
+
+        exec_y = f"exec:1:{source.index('exec(y)') + 1}"
+        sql_y = f"eval_sql:1:{source.index('eval_sql(y)') + 1}"
+        exec_z = f"exec:1:{source.index('exec(z)') + 1}"
+        sql_u = f"eval_sql:1:{source.index('eval_sql(u)') + 1}"
+
+        # 两组独立矛盾分别登记，互不影响。
+        self.assertEqual(
+            {c.conflict_id for c in result.conflicts},
+            {"lib:1:35#lib@v1|lib@v2", "net:1:47#net@v1|net@v2"},
+        )
+        # 未知外部返回与无可行情景是不同状态：整体 INCOMPLETE 而非安全。
+        self.assertIs(result.verdict, Verdict.INCOMPLETE)
+
+        joints = {j.name: j for j in result.joint_scenarios}
+        # 联合情景含两组独立矛盾，最小冲突依据逐对给出，情景判为不可行。
+        joint_all = joints["全候选联合"]
+        self.assertFalse(joint_all.feasible)
+        self.assertEqual(
+            joint_all.minimal_conflicts,
+            (("lib@v1", "lib@v2"), ("net@v1", "net@v2")),
+        )
+        # 不可行情景不吞没其中的风险依据：共享同一外部返回的两个输出点
+        # 都列出带版本的风险结论；未知返回单独记为无法判断。
+        self.assertEqual(
+            set(joint_all.risk_conclusions), {exec_y, sql_y, exec_z}
+        )
+        self.assertEqual(joint_all.undecidable_conclusions, (sql_u,))
+        # 仍然可行的其他情景保留并分别给出结论。
+        self.assertTrue(joints["v1净化系列"].feasible)
+        self.assertEqual(joints["v1净化系列"].risk_conclusions, ())
+        self.assertTrue(joints["v2不净化系列"].feasible)
+        self.assertEqual(
+            set(joints["v2不净化系列"].risk_conclusions),
+            {exec_y, sql_y, exec_z},
+        )
+
+        # 风险路径注明依赖的情景假设与说明版本；共享返回的两个输出点
+        # 各自独立登记，不互相吞没。
+        states = {s.conclusion_id: s.assumptions for s in result.scenarios
+                  if s.state == "risk"}
+        self.assertEqual(states[exec_y], ("lib@v2",))
+        self.assertEqual(states[sql_y], ("lib@v2",))
+        self.assertEqual(states[exec_z], ("net@v2",))
+        diag_by_sink = {}
+        for d in result.diagnostics:
+            diag_by_sink.setdefault(str(d.loc), d)
+        self.assertIn("lib@v2", diag_by_sink[f"1:{source.index('exec(y)') + 1}"].assumptions)
+
+        # 局部撤销 lib@v1：只有涉及它的矛盾消失，net 的矛盾保留；
+        # 共享返回的两个输出点风险结论不受影响。
+        retracted = analyze_source(
+            source,
+            AnalysisConfig(
+                external_specs=specs,
+                spec_alternatives=alts,
+                joint_scenarios=joint_defs,
+                disabled_assumptions={"lib@v1"},
+            ),
+        )
+        self.assertEqual(
+            [c.conflict_id for c in retracted.conflicts],
+            ["net:1:47#net@v1|net@v2"],
+        )
+        joints2 = {j.name: j for j in retracted.joint_scenarios}
+        joint_all2 = joints2["全候选联合"]
+        self.assertFalse(joint_all2.feasible)
+        self.assertEqual(joint_all2.minimal_conflicts, (("net@v1", "net@v2"),))
+        self.assertEqual(joint_all2.withdrawn, ("lib@v1",))
+        self.assertEqual(joints2["v1净化系列"].withdrawn, ("lib@v1",))
+        self.assertEqual(joints2["v1净化系列"].assumptions, ("net@v1",))
+        states2 = {s.conclusion_id: s.assumptions for s in retracted.scenarios
+                   if s.state == "risk"}
+        self.assertEqual(states2[exec_y], ("lib@v2",))
+        self.assertEqual(states2[sql_y], ("lib@v2",))
+
+        # 研究快照保留旧依据；修订说明后派生比较，旧查询保持原情景。
+        _, snapshot = snapshot_analysis(source, config)
+        self.assertEqual(
+            {j.name for j in snapshot.joint_scenarios}, set(joint_defs)
+        )
+        new_specs = {
+            "lib": ExternalSpec(
+                "lib", "lib v3 不净化", "tainted", version="v3"
+            ),
+            "net": specs["net"],
+        }
+        revised, report, new_snapshot = revise_specs(snapshot, new_specs)
+        revised_joints = {j.name: j for j in revised.joint_scenarios}
+        self.assertIn("全候选联合", revised_joints)
+        # 旧快照中的联合情景与最小冲突依据保持原样，可单独回看。
+        old_joint = {j.name: j for j in snapshot.joint_scenarios}["全候选联合"]
+        self.assertEqual(
+            old_joint.minimal_conflicts,
+            (("lib@v1", "lib@v2"), ("net@v1", "net@v2")),
+        )
+        self.assertIn("lib:1:35#lib@v1|lib@v2", report.resolved_conflicts)
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "joint.json"
+            snapshot.save(path)
+            loaded = type(snapshot).load(path)
+            self.assertEqual(
+                {j.name: j.minimal_conflicts for j in loaded.joint_scenarios},
+                {j.name: j.minimal_conflicts for j in snapshot.joint_scenarios},
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

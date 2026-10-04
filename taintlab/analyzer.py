@@ -195,9 +195,19 @@ class ResearchSnapshot:
     conflicts: tuple[AssumptionConflict, ...] = ()
     scenarios: tuple[Scenario, ...] = ()
     alternatives: tuple[ExternalSpec, ...] = ()
+    joint_scenarios: tuple = ()
+    joint_scenario_defs: dict = None
 
     @classmethod
-    def from_result(cls, source, result, specs, disabled_assumptions=(), alternatives=()):
+    def from_result(
+        cls,
+        source,
+        result,
+        specs,
+        disabled_assumptions=(),
+        alternatives=(),
+        joint_scenario_defs=None,
+    ):
         return cls(
             source=source,
             specs=_spec_dict(specs),
@@ -209,6 +219,11 @@ class ResearchSnapshot:
             conflicts=result.conflicts,
             scenarios=result.scenarios,
             alternatives=tuple(alternatives),
+            joint_scenarios=result.joint_scenarios,
+            joint_scenario_defs={
+                name: tuple(assumptions)
+                for name, assumptions in (joint_scenario_defs or {}).items()
+            },
         )
 
     def to_json(self):
@@ -265,6 +280,16 @@ class ResearchSnapshot:
                 )
                 for spec in data.get("alternatives", ())
             ),
+            joint_scenarios=tuple(
+                _decode_joint_scenario(item)
+                for item in data.get("joint_scenarios", ())
+            ),
+            joint_scenario_defs={
+                name: tuple(assumptions)
+                for name, assumptions in data.get(
+                    "joint_scenario_defs", {}
+                ).items()
+            },
         )
 
 
@@ -365,6 +390,23 @@ def _decode_scenario(data):
     )
 
 
+def _decode_joint_scenario(data):
+    from .model import JointScenario
+
+    return JointScenario(
+        name=data["name"],
+        assumptions=tuple(data["assumptions"]),
+        withdrawn=tuple(data.get("withdrawn", ())),
+        conflicts=tuple(data.get("conflicts", ())),
+        minimal_conflicts=tuple(
+            tuple(pair) for pair in data.get("minimal_conflicts", ())
+        ),
+        feasible=data.get("feasible", True),
+        risk_conclusions=tuple(data.get("risk_conclusions", ())),
+        undecidable_conclusions=tuple(data.get("undecidable_conclusions", ())),
+    )
+
+
 def _decode_assumption(data):
     return AssumptionRecord(
         assumption_id=data["assumption_id"],
@@ -386,6 +428,7 @@ def snapshot_analysis(source, config=None):
         config.external_specs,
         config.disabled_assumptions,
         config.spec_alternatives,
+        config.joint_scenarios,
     )
     return result, snapshot
 
@@ -402,12 +445,21 @@ class AnalysisConfig:
     # 额外的候选行为假设（如同一函数的不同版本），与 external_specs 一起
     # 构成假设空间；对同一次调用给出互斥结果的候选会被记为冲突。
     spec_alternatives: tuple[ExternalSpec, ...] = ()
+    # 研究者命名的联合情景：情景名 -> 同时采纳的假设 ID 组（含版本）。
+    joint_scenarios: dict[str, tuple[str, ...]] | None = None
 
     def __post_init__(self) -> None:
         if self.external_specs is None:
             self.external_specs = {}
         self.disabled_assumptions = frozenset(self.disabled_assumptions)
         self.spec_alternatives = tuple(self.spec_alternatives)
+        if self.joint_scenarios is None:
+            self.joint_scenarios = {}
+        else:
+            self.joint_scenarios = {
+                name: tuple(assumptions)
+                for name, assumptions in self.joint_scenarios.items()
+            }
 
 
 class Analyzer:
@@ -427,6 +479,7 @@ class Analyzer:
         self._scenarios: list[Scenario] = []
         self._contradiction_only = False
         self._has_feasible_assumed_risk = False
+        self._joint_scenarios: tuple = ()
 
     # ---------- 对外入口 ----------
 
@@ -476,6 +529,92 @@ class Analyzer:
 
     def scenarios_result(self) -> tuple[Scenario, ...]:
         return tuple(self._scenarios)
+
+    def joint_scenarios_result(self):
+        return self._joint_scenarios
+
+    def build_joint_scenarios(self) -> None:
+        """把研究者命名的假设组评估为联合情景。
+
+        被局部撤销（disabled_assumptions）的假设从情景中剔除并单独记录；
+        情景内部若含有对同一次调用互斥的假设对，则不可行，最小冲突依据
+        就是这些互斥假设对本身（去掉任一条该组矛盾即消失），多组独立
+        矛盾各自列出、互不影响。未知外部返回导致的无法判断结论与
+        “无可行情景”分开记录。
+        """
+
+        from .model import JointScenario
+
+        disabled = self.config.disabled_assumptions
+        built = []
+        for name, assumptions in self.config.joint_scenarios.items():
+            active = tuple(a for a in assumptions if a not in disabled)
+            withdrawn = tuple(a for a in assumptions if a in disabled)
+            active_set = set(active)
+            internal = [
+                conflict
+                for conflict in self._conflicts.values()
+                if set(conflict.assumptions) <= active_set
+            ]
+            minimal_conflicts = tuple(
+                tuple(sorted(conflict.assumptions)) for conflict in internal
+            )
+            feasible = not internal
+            risk_conclusions: list[str] = []
+            undecidable_conclusions: list[str] = []
+            for explanation in self._explanations:
+                has_risk = False
+                for item in explanation.path_explanations:
+                    if item.kind != "risk":
+                        continue
+                    if item.evidence == Evidence.UNKNOWN:
+                        if explanation.conclusion_id not in undecidable_conclusions:
+                            undecidable_conclusions.append(
+                                explanation.conclusion_id
+                            )
+                        continue
+                    if item.evidence == Evidence.CONFIRMED:
+                        has_risk = True
+                        break
+                    if not set(item.assumptions) <= active_set:
+                        continue
+                    sites = set(item.assumption_sites)
+                    if any(
+                        (c.assumptions[0], c.loc.line, c.loc.col) in sites
+                        and (c.assumptions[1], c.loc.line, c.loc.col) in sites
+                        for c in internal
+                    ):
+                        continue
+                    has_risk = True
+                    break
+                if has_risk:
+                    risk_conclusions.append(explanation.conclusion_id)
+            if internal:
+                self.notes.append(
+                    f"联合情景 {name} 不可行：最小冲突依据 "
+                    + "；".join(
+                        " 与 ".join(pair) + " 互斥" for pair in minimal_conflicts
+                    )
+                    + "；其余情景不受影响，仍分别有效"
+                )
+            for assumption_id in withdrawn:
+                self.notes.append(
+                    f"联合情景 {name}: 假设 {assumption_id} 已被局部撤销，"
+                    "仅解除涉及它的矛盾，其余矛盾保留"
+                )
+            built.append(
+                JointScenario(
+                    name=name,
+                    assumptions=active,
+                    withdrawn=withdrawn,
+                    conflicts=tuple(c.conflict_id for c in internal),
+                    minimal_conflicts=minimal_conflicts,
+                    feasible=feasible,
+                    risk_conclusions=tuple(risk_conclusions),
+                    undecidable_conclusions=tuple(undecidable_conclusions),
+                )
+            )
+        self._joint_scenarios = tuple(built)
 
     def explanations_result(self) -> tuple[ConclusionExplanation, ...]:
         return tuple(self._explanations)
@@ -1220,6 +1359,7 @@ class Analyzer:
 def analyze_program(program: Program, config: AnalysisConfig | None = None):
     analyzer = Analyzer(program, config or AnalysisConfig())
     verdict, diagnostics, notes, assumptions = analyzer.run()
+    analyzer.build_joint_scenarios()
     from .model import AnalysisResult
 
     return AnalysisResult(
@@ -1230,6 +1370,7 @@ def analyze_program(program: Program, config: AnalysisConfig | None = None):
         explanations=analyzer.explanations_result(),
         conflicts=analyzer.conflicts_result(),
         scenarios=analyzer.scenarios_result(),
+        joint_scenarios=analyzer.joint_scenarios_result(),
     )
 
 
@@ -1250,7 +1391,13 @@ def analyze_source(source: str, config: AnalysisConfig | None = None) -> "Analys
     return analyze_program(program, config)
 
 
-def revise_specs(snapshot, new_specs=None, disabled_assumptions=(), spec_alternatives=None):
+def revise_specs(
+    snapshot,
+    new_specs=None,
+    disabled_assumptions=(),
+    spec_alternatives=None,
+    joint_scenarios=None,
+):
     """修订行为说明后重算，并按稳定结论位置标记受影响/可复用解释。
 
     未显式给出 ``spec_alternatives`` 时沿用快照中的候选假设；旧情景、
@@ -1260,10 +1407,13 @@ def revise_specs(snapshot, new_specs=None, disabled_assumptions=(), spec_alterna
 
     if spec_alternatives is None:
         spec_alternatives = snapshot.alternatives
+    if joint_scenarios is None:
+        joint_scenarios = snapshot.joint_scenario_defs or {}
     config = AnalysisConfig(
         external_specs=_spec_dict(new_specs),
         disabled_assumptions=frozenset(disabled_assumptions),
         spec_alternatives=tuple(spec_alternatives),
+        joint_scenarios=joint_scenarios,
     )
     result = analyze_source(snapshot.source, config)
     new_snapshot = ResearchSnapshot.from_result(
@@ -1272,6 +1422,7 @@ def revise_specs(snapshot, new_specs=None, disabled_assumptions=(), spec_alterna
         new_specs,
         disabled_assumptions,
         spec_alternatives,
+        joint_scenarios,
     )
     changes = tuple(compare_external_specs(snapshot.specs, new_specs))
     changed_names = {

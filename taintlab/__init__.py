@@ -14,7 +14,7 @@ from .model import (
     TaintPath,
     Verdict,
 )
-from .model import AssumptionConflict, Scenario
+from .model import AssumptionConflict, JointScenario, Scenario
 from .analyzer import (
     analyze_source,
     analyze_program,
@@ -38,6 +38,7 @@ __all__ = [
     "AnalysisResult",
     "AssumptionRecord",
     "AssumptionConflict",
+    "JointScenario",
     "ConclusionExplanation",
     "Evidence",
     "ExternalSpec",
