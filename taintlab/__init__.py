@@ -16,6 +16,18 @@ from .model import (
 )
 from .model import AssumptionConflict, Scenario
 from .model import NamedScenario, NamedScenarioResult, ScenarioSinkConclusion
+from .coverage import (
+    CallSiteCoverage,
+    CoveragePlan,
+    CoveragePlanRevision,
+    CoveragePlanStudy,
+    CoverageRevision,
+    TargetCoverage,
+    adopt_coverage_plan,
+    format_coverage_text,
+    plan_coverage,
+    revise_coverage,
+)
 from .analyzer import (
     analyze_source,
     analyze_program,
@@ -38,6 +50,16 @@ from .lexer import LexerError
 from .parser import ParseError
 
 __all__ = [
+    "CallSiteCoverage",
+    "CoveragePlan",
+    "CoveragePlanRevision",
+    "CoveragePlanStudy",
+    "CoverageRevision",
+    "TargetCoverage",
+    "adopt_coverage_plan",
+    "format_coverage_text",
+    "plan_coverage",
+    "revise_coverage",
     "analyze_source",
     "analyze_program",
     "AnalysisConfig",

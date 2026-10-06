@@ -107,6 +107,21 @@ def 函数名(参数, ...) { 语句; ... }
     `revise_specs` 派生新研究并重投影，旧 `ScenarioStudy` 对象不被修改；
     `ScenarioStudy.save()/load()` 可把研究（含情景、最小冲突、逐路径依据）
     持久化为 JSON；`format_study_text(study)` 输出可比较的文本结论。
+- **外部行为说明的范围覆盖规划**：`plan_coverage(source, targets,
+  available_specs, config)` 让研究者指定一组需要解释的输出位置（sink 结论
+  ID）与可采用的库版本说明，系统搜索能覆盖这些位置且不含重叠矛盾的说明
+  组合（`CoveragePlanStudy.plans`）。逐调用点的 `CallSiteCoverage` 展示
+  文件范围与局部说明同时存在时每个调用点实际适用哪条说明：文件级安全结论
+  不会扩展到另一文件，也不会覆盖已明确的局部风险（只采用更宽作用域说明而
+  忽略更窄局部说明的组合会被拒绝）；`unknown_sites` 明确列出仍依赖未知
+  行为的调用。互不相交的不同版本可共同采用；同一调用实例上互斥的说明组合
+  被记入 `blocked_combinations` 并阻止形成可行方案。`min_new`（最少新增
+  说明）与 `max_keep`（尽量保留现有说明）两种策略可比较；
+  `revise_coverage(study, revoked)` 撤销一条依据后只重算受影响的输出位置，
+  其余位置沿用旧结论对象（`affected_conclusions` / `reused_conclusions`）；
+  `CoveragePlanStudy.save()/load()` 重开后保留未知位置与版本选择；
+  `adopt_coverage_plan(plan, source)` 采用方案时条件安全不会被提升为无条件
+  安全（最高 `ASSUMED`）；`format_coverage_text(study)` 输出文本结论。
 
 三类证据分开诊断：`TAINT-FLOW` / `CONFIRMED`（已证实）、
 `TAINT-ASSUMED` / `ASSUMED`（依赖外部说明）、`TAINT-UNCERTAIN` /
@@ -133,5 +148,6 @@ python -m unittest discover -s tests        # 自带正反例测试
 - `taintlab/lexer.py`、`taintlab/parser.py`、`taintlab/ast_nodes.py`：词法/语法/AST
 - `taintlab/callgraph.py`：函数调用关系
 - `taintlab/model.py`：诊断记录、传播路径、分析结论
+- `taintlab/coverage.py`：外部行为说明的范围覆盖规划
 - `taintlab/analyzer.py`：污点传播分析器
 - `examples/`、`tests/`：正反例与回归测试
