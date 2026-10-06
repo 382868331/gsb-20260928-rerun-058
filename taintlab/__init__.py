@@ -16,6 +16,17 @@ from .model import (
 )
 from .model import AssumptionConflict, Scenario
 from .model import NamedScenario, NamedScenarioResult, ScenarioSinkConclusion
+from .planner import (
+    CallSiteApplicability,
+    CoveragePlan,
+    CoveragePlanComparison,
+    PlanRevisionReport,
+    TargetCoverage,
+    compare_coverage_strategies,
+    format_plan_text,
+    plan_coverage,
+    revise_plan,
+)
 from .analyzer import (
     analyze_source,
     analyze_program,
@@ -63,6 +74,15 @@ __all__ = [
     "snapshot_analysis",
     "study_scenarios",
     "format_study_text",
+    "plan_coverage",
+    "compare_coverage_strategies",
+    "revise_plan",
+    "format_plan_text",
+    "CoveragePlan",
+    "CoveragePlanComparison",
+    "CallSiteApplicability",
+    "TargetCoverage",
+    "PlanRevisionReport",
     "Diagnostic",
     "Severity",
     "TaintPath",

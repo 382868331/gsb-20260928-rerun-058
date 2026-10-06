@@ -110,6 +110,10 @@ class ExternalSpecScope:
     def matches(self, loc: Loc) -> bool:
         if self.kind == "global":
             return True
+        if self.path is not None:
+            # 指定了其它文件路径的作用域不匹配当前分析单元：
+            # 文件级安全结论不得扩展到另一文件。
+            return False
         if self.kind == "file":
             return True
         return self.line == loc.line and self.col == loc.col

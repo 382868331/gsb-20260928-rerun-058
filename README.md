@@ -105,8 +105,25 @@ def 函数名(参数, ...) { 语句; ... }
   - 派生比较研究、旧查询保持原依据：`revise_study(study, new_specs,
     scenarios=..., disabled_assumptions=..., spec_alternatives=...)` 基于
     `revise_specs` 派生新研究并重投影，旧 `ScenarioStudy` 对象不被修改；
-    `ScenarioStudy.save()/load()` 可把研究（含情景、最小冲突、逐路径依据）
-    持久化为 JSON；`format_study_text(study)` 输出可比较的文本结论。
+     `ScenarioStudy.save()/load()` 可把研究（含情景、最小冲突、逐路径依据）
+     持久化为 JSON；`format_study_text(study)` 输出可比较的文本结论。
+- **外部行为说明的范围覆盖规划**：`plan_coverage(source, targets,`
+  available_specs, existing_specs=..., strategy=...)` 针对研究者指定的一组
+  输出位置（sink 结论 ID，缺省取全部结论位置）寻找能够覆盖这些位置、且
+  内部没有重叠矛盾的说明组合，并在 `CoveragePlan.applicability` 中逐调用点
+  展示实际适用的说明（文件级说明只作用于本文件匹配位置，不会扩展到另一
+  文件或覆盖已明确的局部风险说明），未被任何说明覆盖的调用保留在
+  `unknown_positions` 中。互不相交的不同版本可以共同采用；同一调用实例上
+  互斥的说明使方案 `feasible=False` 并列入 `blocking_conflicts`。
+  `compare_coverage_strategies(...)` 比较 `minimal`（最少新增说明，允许
+  新说明替换冲突的现有说明并记入 `dropped_existing`）与 `preserve`
+  （尽量保留现有说明，新增不得驱逐现有说明）两种方案；
+  `revise_plan(plan, disabled_assumptions=...)` 撤销一条依据后只重算受影响
+  的输出目标（`PlanRevisionReport.affected_targets` / `reused_targets`，
+  未受影响目标复用旧对象）；`CoveragePlan.save()/load()` 持久化方案，
+  重开后保留未知位置与版本选择；`plan.adopt_config()` 采用方案只是把说明
+  放进分析配置，条件安全结论仍判为 `ASSUMED`，不会提升为无条件 `SAFE`；
+  `format_plan_text(plan)` 输出可比较的文本结论。
 
 三类证据分开诊断：`TAINT-FLOW` / `CONFIRMED`（已证实）、
 `TAINT-ASSUMED` / `ASSUMED`（依赖外部说明）、`TAINT-UNCERTAIN` /
